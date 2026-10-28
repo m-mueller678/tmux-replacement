@@ -10,13 +10,19 @@ use crate::session::SessionId;
 pub enum Action {
     New,
     Exit,
+    KillServer,
 }
 
 /// Menu entries with fixed names. Sessions sharing one of these names are
 /// shown as `s#<name>`.
 pub const BUILTINS: &[(&str, Action, &str)] = &[
     ("new", Action::New, "create a new session"),
-    ("exit", Action::Exit, "quit, ending all sessions"),
+    ("exit", Action::Exit, "leave; sessions keep running"),
+    (
+        "kill-server",
+        Action::KillServer,
+        "end all sessions and the server",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

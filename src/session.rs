@@ -14,7 +14,7 @@ use std::thread;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use vt100::capture::{BasicFormattedCaptureRange, BasicFormattedCaptureState};
 
-use crate::Event;
+use crate::server::Event;
 use crate::term::MODE_RESET;
 
 pub type SessionId = u64;
@@ -119,10 +119,16 @@ impl Session {
         self.parser.screen().alternate_screen()
     }
 
-    pub fn resize(&mut self, size: (u16, u16)) {
+    /// Returns whether the size changed.
+    pub fn resize(&mut self, size: (u16, u16)) -> bool {
+        let (rows, cols) = self.parser.screen().size();
+        if (rows.get(), cols.get()) == size {
+            return false;
+        }
         // SAFETY: TIOCSWINSZ reads a winsize from the provided pointer.
         unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize(size)) };
         self.parser.set_size(nz(size.0), nz(size.1));
+        true
     }
 
     /// Working directory of the session's foreground process.

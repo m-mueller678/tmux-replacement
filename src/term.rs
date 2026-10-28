@@ -9,6 +9,11 @@ use nix::sys::termios::{self, SetArg, Termios};
 /// Undoes the input modes an application may have left enabled.
 pub const MODE_RESET: &str = "\x1b[?1l\x1b>\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[0 q";
 
+/// Puts the terminal back in a sane state for the shell the user returns to.
+pub fn reset() -> String {
+    format!("{MODE_RESET}\x1b[0m\x1b[?25h")
+}
+
 static ORIGINAL: Mutex<Option<Termios>> = Mutex::new(None);
 
 fn stdin_fd() -> BorrowedFd<'static> {
