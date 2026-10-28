@@ -9,11 +9,15 @@ use crate::session::SessionId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     New,
+    Exit,
 }
 
 /// Menu entries with fixed names. Sessions sharing one of these names are
 /// shown as `s#<name>`.
-pub const BUILTINS: &[(&str, Action, &str)] = &[("new", Action::New, "create a new session")];
+pub const BUILTINS: &[(&str, Action, &str)] = &[
+    ("new", Action::New, "create a new session"),
+    ("exit", Action::Exit, "quit, ending all sessions"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -35,8 +39,96 @@ pub enum Outcome {
     /// Ctrl-b: return to the previous session and send it a literal ctrl-b.
     PassPrefix,
     Select(Target),
-    /// Enter on a query matching nothing: create a session with that name.
+    /// Ask for the name of a new session, prefilled with the given text.
+    NameSession(String),
+    /// The name prompt was confirmed.
     Create(String),
+}
+
+enum Key {
+    Text(String),
+    Enter,
+    Escape,
+    Up,
+    Down,
+    Backspace,
+    ClearLine,
+    DeleteWord,
+    Prefix,
+    Interrupt,
+    Ignored,
+}
+
+/// Decodes one key from the start of `bytes`, returning it and its length.
+fn parse_key(bytes: &[u8]) -> (Key, usize) {
+    let key = match bytes[0] {
+        0x1b => match bytes.get(1) {
+            // A lone escape at the end of a read is the escape key.
+            None => return (Key::Escape, 1),
+            Some(b'[' | b'O') => {
+                let end = (2..bytes.len())
+                    .find(|&j| (0x40..=0x7e).contains(&bytes[j]))
+                    .unwrap_or(bytes.len() - 1);
+                let key = match bytes[end] {
+                    b'A' => Key::Up,
+                    b'B' => Key::Down,
+                    _ => Key::Ignored,
+                };
+                return (key, end + 1);
+            }
+            // Alt+key.
+            Some(_) => return (Key::Ignored, 2),
+        },
+        b'\r' => Key::Enter,
+        0x02 => Key::Prefix,
+        0x03 | 0x07 => Key::Interrupt,
+        0x10 | 0x0b => Key::Up,
+        0x0e | b'\n' => Key::Down,
+        0x7f | 0x08 => Key::Backspace,
+        0x15 => Key::ClearLine,
+        0x17 => Key::DeleteWord,
+        b if b < 0x20 => Key::Ignored,
+        b => {
+            let len = match b {
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                _ => 1,
+            }
+            .min(bytes.len());
+            let key = match std::str::from_utf8(&bytes[..len]) {
+                Ok(s) => Key::Text(s.to_string()),
+                Err(_) => Key::Ignored,
+            };
+            return (key, len);
+        }
+    };
+    (key, 1)
+}
+
+/// Applies a line-editing key to `line`. Returns false if the key is not an
+/// editing key.
+fn edit(line: &mut String, key: &Key) -> bool {
+    match key {
+        Key::Text(s) => line.push_str(s),
+        Key::Backspace => {
+            line.pop();
+        }
+        Key::ClearLine => line.clear(),
+        Key::DeleteWord => {
+            let trimmed = line.trim_end_matches(' ');
+            let keep = trimmed.rfind(' ').map_or(0, |p| p + 1);
+            line.truncate(keep);
+        }
+        _ => return false,
+    }
+    true
+}
+
+struct NamePrompt {
+    name: String,
+    /// Used when the name is left empty.
+    default: String,
 }
 
 /// Bytes that arrive for the session while the menu is open, replayed when
@@ -53,6 +145,7 @@ pub struct Menu {
     /// Indices into `items` with the matched char positions, best first.
     matches: Vec<(usize, Vec<usize>)>,
     message: Option<String>,
+    naming: Option<NamePrompt>,
 }
 
 impl Menu {
@@ -66,6 +159,7 @@ impl Menu {
             items: Vec::new(),
             matches: Vec::new(),
             message: None,
+            naming: None,
         };
         menu.set_items(items);
         menu
@@ -79,6 +173,11 @@ impl Menu {
     pub fn forget_return_target(&mut self) {
         self.return_to = None;
         self.pending.clear();
+    }
+
+    pub fn prompt_name(&mut self, name: String, default: String) {
+        self.message = None;
+        self.naming = Some(NamePrompt { name, default });
     }
 
     pub fn set_message(&mut self, message: String) {
@@ -122,75 +221,13 @@ impl Menu {
     pub fn handle_input(&mut self, bytes: &[u8]) -> (Outcome, usize) {
         let mut i = 0;
         while i < bytes.len() {
-            let b = bytes[i];
-            i += 1;
-            let outcome = match b {
-                0x1b => match bytes.get(i) {
-                    // A lone escape at the end of a read is the escape key.
-                    None => Outcome::Cancel,
-                    Some(b'[' | b'O') => {
-                        let start = i + 1;
-                        let end = (start..bytes.len())
-                            .find(|&j| (0x40..=0x7e).contains(&bytes[j]))
-                            .unwrap_or(bytes.len() - 1);
-                        i = end + 1;
-                        match bytes[end] {
-                            b'A' => self.move_selection(1),
-                            b'B' => self.move_selection(-1),
-                            _ => {}
-                        }
-                        Outcome::Continue
-                    }
-                    // Alt+key: ignore.
-                    Some(_) => {
-                        i += 1;
-                        Outcome::Continue
-                    }
-                },
-                b'\r' => self.accept(),
-                0x02 => Outcome::PassPrefix,
-                0x03 | 0x07 => Outcome::Cancel,
-                0x10 | 0x0b => {
-                    self.move_selection(1);
-                    Outcome::Continue
-                }
-                0x0e | b'\n' => {
-                    self.move_selection(-1);
-                    Outcome::Continue
-                }
-                0x7f | 0x08 => {
-                    self.query.pop();
-                    self.edited();
-                    Outcome::Continue
-                }
-                0x15 => {
-                    self.query.clear();
-                    self.edited();
-                    Outcome::Continue
-                }
-                0x17 => {
-                    let trimmed = self.query.trim_end_matches(' ');
-                    let keep = trimmed.rfind(' ').map_or(0, |p| p + 1);
-                    self.query.truncate(keep);
-                    self.edited();
-                    Outcome::Continue
-                }
-                b if b < 0x20 => Outcome::Continue,
-                _ => {
-                    let len = match b {
-                        0xc0..=0xdf => 2,
-                        0xe0..=0xef => 3,
-                        0xf0..=0xf7 => 4,
-                        _ => 1,
-                    };
-                    let end = (i - 1 + len).min(bytes.len());
-                    if let Ok(s) = std::str::from_utf8(&bytes[i - 1..end]) {
-                        self.query.push_str(s);
-                        self.edited();
-                    }
-                    i = end;
-                    Outcome::Continue
-                }
+            let (key, len) = parse_key(&bytes[i..]);
+            i += len;
+            let outcome = match key {
+                Key::Prefix => Outcome::PassPrefix,
+                Key::Interrupt => Outcome::Cancel,
+                _ if self.naming.is_some() => self.name_key(key),
+                _ => self.list_key(key),
             };
             if !matches!(outcome, Outcome::Continue) {
                 return (outcome, i);
@@ -199,9 +236,49 @@ impl Menu {
         (Outcome::Continue, i)
     }
 
-    fn edited(&mut self) {
-        self.message = None;
-        self.refilter();
+    fn list_key(&mut self, key: Key) -> Outcome {
+        match key {
+            Key::Escape => return Outcome::Cancel,
+            Key::Enter => return self.accept(),
+            Key::Up => self.move_selection(1),
+            Key::Down => self.move_selection(-1),
+            key => {
+                if edit(&mut self.query, &key) {
+                    self.message = None;
+                    self.refilter();
+                }
+            }
+        }
+        Outcome::Continue
+    }
+
+    fn name_key(&mut self, key: Key) -> Outcome {
+        let prompt = self.naming.as_mut().unwrap();
+        match key {
+            Key::Escape => {
+                self.naming = None;
+                self.message = None;
+            }
+            Key::Enter => {
+                let name = prompt.name.trim();
+                let name = if name.is_empty() {
+                    &prompt.default
+                } else {
+                    name
+                };
+                if name.contains('#') {
+                    self.message = Some("session names cannot contain '#'".into());
+                } else {
+                    return Outcome::Create(name.to_string());
+                }
+            }
+            key => {
+                if edit(&mut prompt.name, &key) {
+                    self.message = None;
+                }
+            }
+        }
+        Outcome::Continue
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -210,17 +287,9 @@ impl Menu {
     }
 
     fn accept(&mut self) -> Outcome {
-        if let Some((i, _)) = self.matches.get(self.selected) {
-            return Outcome::Select(self.items[*i].target);
-        }
-        let name = self.query.trim();
-        if name.is_empty() {
-            Outcome::Continue
-        } else if name.contains('#') {
-            self.message = Some("session names cannot contain '#'".into());
-            Outcome::Continue
-        } else {
-            Outcome::Create(name.to_string())
+        match self.matches.get(self.selected) {
+            Some((i, _)) => Outcome::Select(self.items[*i].target),
+            None => Outcome::NameSession(self.query.trim().to_string()),
         }
     }
 
@@ -229,6 +298,26 @@ impl Menu {
     pub fn render(&self, (rows, cols): (u16, u16)) -> String {
         let cols = cols as usize;
         let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[0m\x1b[H\x1b[2J");
+
+        if let Some(prompt) = &self.naming {
+            let (color, info) = match &self.message {
+                Some(msg) => ("31", msg.clone()),
+                None => (
+                    "2",
+                    format!(
+                        "name for the new session (empty: {}), esc to go back",
+                        prompt.default
+                    ),
+                ),
+            };
+            let _ = write!(
+                out,
+                "\x1b[{};1H  \x1b[{color}m{}\x1b[0m",
+                rows.saturating_sub(1).max(1),
+                truncate(&info, cols.saturating_sub(2))
+            );
+            return finish_prompt(out, rows, cols, "name", &prompt.name);
+        }
 
         let list_rows = (rows as usize).saturating_sub(2);
         let offset = (self.selected + 1).saturating_sub(list_rows);
@@ -280,14 +369,20 @@ impl Menu {
             rows.saturating_sub(1).max(1)
         );
 
-        let query = truncate(&self.query, cols.saturating_sub(3));
-        let _ = write!(
-            out,
-            "\x1b[{rows};1H\x1b[1;34m>\x1b[0m {query}\x1b[{rows};{}H\x1b[?25h\x1b[?2026l",
-            3 + query.width()
-        );
-        out
+        finish_prompt(out, rows, cols, "", &self.query)
     }
+}
+
+/// Draws the input line on the bottom row and leaves the cursor in it.
+fn finish_prompt(mut out: String, rows: u16, cols: usize, label: &str, text: &str) -> String {
+    let prefix = format!("{label}> ");
+    let text = truncate(text, cols.saturating_sub(prefix.width() + 1));
+    let _ = write!(
+        out,
+        "\x1b[{rows};1H\x1b[1;34m{prefix}\x1b[0m{text}\x1b[{rows};{}H\x1b[?25h\x1b[?2026l",
+        1 + prefix.width() + text.width()
+    );
+    out
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -393,8 +488,22 @@ mod tests {
             (Outcome::PassPrefix, 1)
         ));
         menu.handle_input(b"\x15zzz");
-        assert!(matches!(menu.handle_input(b"\r"), (Outcome::Create(ref n), _) if n == "zzz"));
-        menu.handle_input(b"\x15a#b");
-        assert!(matches!(menu.handle_input(b"\r"), (Outcome::Continue, _)));
+        assert!(matches!(menu.handle_input(b"\r"), (Outcome::NameSession(ref n), _) if n == "zzz"));
+    }
+
+    #[test]
+    fn name_prompt() {
+        let mut menu = Menu::new(None, Vec::new());
+        menu.prompt_name("ab".into(), "3".into());
+        menu.handle_input(b"\x7fc");
+        assert!(matches!(menu.handle_input(b"\r"), (Outcome::Create(ref n), _) if n == "ac"));
+        menu.handle_input(b"\x15");
+        assert!(matches!(menu.handle_input(b"\r"), (Outcome::Create(ref n), _) if n == "3"));
+        menu.handle_input(b"a#b");
+        assert!(matches!(menu.handle_input(b"\r"), (Outcome::Continue, 1)));
+        assert!(menu.message.is_some());
+        menu.handle_input(b"\x1b");
+        assert!(menu.naming.is_none());
+        assert!(matches!(menu.handle_input(b"\x1b"), (Outcome::Cancel, 1)));
     }
 }

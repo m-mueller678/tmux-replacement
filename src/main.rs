@@ -78,13 +78,9 @@ impl App {
                 None => self.leave_menu(),
             },
             Outcome::Select(Target::Session(id)) => self.attach(id),
-            Outcome::Select(Target::Action(Action::New)) => {
-                let name = (0..)
-                    .map(|n: u64| n.to_string())
-                    .find(|n| !self.name_taken(n))
-                    .unwrap();
-                self.create(name);
-            }
+            Outcome::Select(Target::Action(Action::New)) => self.prompt_name(String::new()),
+            Outcome::Select(Target::Action(Action::Exit)) => self.quit = true,
+            Outcome::NameSession(name) => self.prompt_name(name),
             Outcome::Create(name) => {
                 if self.name_taken(&name) {
                     self.menu_message(format!("session '{name}' already exists"));
@@ -95,16 +91,27 @@ impl App {
         }
     }
 
+    fn prompt_name(&mut self, name: String) {
+        let default = (0..)
+            .map(|n: u64| n.to_string())
+            .find(|n| !self.name_taken(n))
+            .unwrap();
+        if let Mode::Menu(menu) = &mut self.mode {
+            menu.prompt_name(name, default);
+        }
+        self.render_menu();
+    }
+
     fn name_taken(&self, name: &str) -> bool {
         self.sessions.values().any(|s| s.name == name)
     }
 
-    /// Escape: back to the previous session, or quit if there is none.
+    /// Escape: back to the previous session. Without any session there is
+    /// nothing to go back to, so the picker stays open.
     fn leave_menu(&mut self) {
         let Mode::Menu(menu) = &self.mode else { return };
-        match menu.return_to.or_else(|| self.mru.first().copied()) {
-            Some(id) => self.attach(id),
-            None => self.quit = true,
+        if let Some(id) = menu.return_to.or_else(|| self.mru.first().copied()) {
+            self.attach(id);
         }
     }
 
@@ -218,13 +225,7 @@ impl App {
         }
         self.mru.retain(|&s| s != id);
         match &mut self.mode {
-            Mode::Attached(active) if *active == id => {
-                if self.sessions.is_empty() {
-                    self.quit = true;
-                } else {
-                    self.open_menu(None);
-                }
-            }
+            Mode::Attached(active) if *active == id => self.open_menu(None),
             Mode::Attached(_) => {}
             Mode::Menu(menu) => {
                 if menu.return_to == Some(id) {
