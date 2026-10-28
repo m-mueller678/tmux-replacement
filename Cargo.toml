@@ -1,0 +1,11 @@
+[package]
+name = "tmux-replacement"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vt100 = "0.18"
+nix = { version = "0.31", features = ["term", "process", "signal", "fs", "ioctl"] }
+libc = "0.2"
+signal-hook = "0.3"
+unicode-width = "0.2"
