@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::thread;
 
 use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
@@ -23,18 +23,41 @@ pub enum Event {
     Output(SessionId, Vec<u8>),
     Exited(SessionId),
     ChildExited,
-    Connected {
-        stream: UnixStream,
-        version: u32,
-        size: (u16, u16),
-        cwd: PathBuf,
-    },
+    Connected(UnixStream, Greeting),
     Message(ClientId, ClientMsg),
     Disconnected(ClientId),
     Quit,
 }
 
 type ClientId = u64;
+
+/// The fields of a client's Hello.
+pub struct Greeting {
+    version: u32,
+    size: (u16, u16),
+    cwd: PathBuf,
+    token: u64,
+    resume: Option<String>,
+}
+
+/// Messages a client has not read yet before it is considered gone. Bounds
+/// memory when a connection silently died, e.g. over a lost network.
+const CLIENT_QUEUE: usize = 4096;
+
+/// The sending half of a client connection.
+struct Peer {
+    queue: SyncSender<ServerMsg>,
+    stream: UnixStream,
+}
+
+impl Peer {
+    fn post(&self, msg: ServerMsg) {
+        if let Err(TrySendError::Full(_)) = self.queue.try_send(msg) {
+            // Ends the reader thread too, which reports the disconnect.
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
 
 const PREFIX: u8 = 0x02; // ctrl-b
 
@@ -48,7 +71,8 @@ struct Client {
     size: (u16, u16),
     /// Starting directory for sessions created without a previous session.
     cwd: PathBuf,
-    out: Sender<ServerMsg>,
+    token: u64,
+    out: Peer,
 }
 
 struct Server {
@@ -64,31 +88,60 @@ struct Server {
 
 impl Server {
     fn send(&self, cid: ClientId, bytes: impl Into<Vec<u8>>) {
+        self.post(cid, ServerMsg::Output(bytes.into()));
+    }
+
+    fn post(&self, cid: ClientId, msg: ServerMsg) {
         if let Some(client) = self.clients.get(&cid) {
-            let _ = client.out.send(ServerMsg::Output(bytes.into()));
+            client.out.post(msg);
         }
     }
 
-    fn connect(&mut self, stream: UnixStream, version: u32, size: (u16, u16), cwd: PathBuf) {
+    fn broadcast_sessions(&self) {
+        let names: Vec<_> = self.sessions.values().map(|s| s.name.clone()).collect();
+        for client in self.clients.values() {
+            client.out.post(ServerMsg::Sessions(names.clone()));
+        }
+    }
+
+    fn connect(&mut self, stream: UnixStream, hello: Greeting) {
         let cid = self.next_client;
         self.next_client += 1;
         let Ok(out) = spawn_client_threads(cid, stream, self.events.clone()) else {
             return;
         };
-        if version != VERSION {
+        if hello.version != VERSION {
             let msg = "the running server is from a different version; end its sessions and kill it first\r\n";
-            let _ = out.send(ServerMsg::Output(msg.into()));
-            let _ = out.send(ServerMsg::Exit);
+            out.post(ServerMsg::Output(msg.into()));
+            out.post(ServerMsg::Exit);
             return;
         }
+        // A reconnecting client replaces the connection it lost.
+        self.clients.retain(|_, c| {
+            let stale = c.token == hello.token;
+            if stale {
+                let _ = c.out.stream.shutdown(std::net::Shutdown::Both);
+            }
+            !stale
+        });
         let client = Client {
-            mode: Mode::Attached(0),
-            size,
-            cwd,
+            // Not a session id, so attach() never mistakes it for one.
+            mode: Mode::Attached(SessionId::MAX),
+            size: hello.size,
+            cwd: hello.cwd,
+            token: hello.token,
             out,
         };
         self.clients.insert(cid, client);
-        self.open_menu(cid, None);
+        self.broadcast_sessions();
+        let resume = hello
+            .resume
+            .and_then(|name| self.sessions.iter().find(|(_, s)| s.name == name))
+            .map(|(id, _)| *id);
+        match resume {
+            Some(id) => self.attach(cid, id),
+            None => self.open_menu(cid, None),
+        }
     }
 
     fn message(&mut self, cid: ClientId, msg: ClientMsg) {
@@ -227,6 +280,13 @@ impl Server {
             return;
         };
         client.mode = Mode::Menu(Menu::new(return_to, items));
+        self.post(
+            cid,
+            ServerMsg::View {
+                session: None,
+                fresh: false,
+            },
+        );
         // The alternate screen preserves the session's display and
         // scrollback underneath the menu.
         self.send(cid, format!("\x1b[?1049h{}", term::MODE_RESET));
@@ -280,18 +340,27 @@ impl Server {
             Mode::Attached(current) if current == id => return,
             _ => None,
         };
-        let out = match replay {
+        let view = |fresh| ServerMsg::View {
+            session: Some(session.name.clone()),
+            fresh,
+        };
+        let client = &self.clients[&cid];
+        match replay {
             // Leaving the alternate screen restores exactly what the outer
             // terminal showed before the menu opened; then catch up.
-            Some(pending) => {
-                let mut out = b"\x1b[?1049l".to_vec();
-                out.extend_from_slice(&pending);
-                out.extend_from_slice(session.modes().as_bytes());
-                out
+            Some(mut pending) => {
+                client.out.post(view(false));
+                client.out.post(ServerMsg::Output(b"\x1b[?1049l".to_vec()));
+                pending.extend_from_slice(session.modes().as_bytes());
+                client.out.post(ServerMsg::SessionOutput(pending));
             }
-            None => session.repaint().into_bytes(),
-        };
-        self.send(cid, out);
+            None => {
+                client.out.post(view(true));
+                client
+                    .out
+                    .post(ServerMsg::SessionOutput(session.repaint().into_bytes()));
+            }
+        }
         self.mru.retain(|&s| s != id);
         self.mru.insert(0, id);
     }
@@ -314,6 +383,7 @@ impl Server {
                 self.sessions.insert(id, session);
                 self.attach(cid, id);
                 self.refresh_menus();
+                self.broadcast_sessions();
             }
             Err(e) => self.menu_message(cid, format!("failed to start shell: {e}")),
         }
@@ -341,14 +411,14 @@ impl Server {
                 forward.extend(notification.sequence);
             }
             for client in self.clients.values() {
-                let _ = client.out.send(ServerMsg::Output(forward.clone()));
+                client.out.post(ServerMsg::Output(forward.clone()));
             }
             self.refresh_menus();
         }
         for client in self.clients.values_mut() {
             match &mut client.mode {
                 Mode::Attached(active) if *active == id => {
-                    let _ = client.out.send(ServerMsg::Output(bytes.to_vec()));
+                    client.out.post(ServerMsg::SessionOutput(bytes.to_vec()));
                 }
                 Mode::Menu(menu) if menu.return_to == Some(id) => menu.buffer_output(bytes),
                 _ => {}
@@ -361,6 +431,7 @@ impl Server {
             return;
         }
         self.mru.retain(|&s| s != id);
+        self.broadcast_sessions();
         let cids: Vec<_> = self.clients.keys().copied().collect();
         for cid in cids {
             match &mut self.clients.get_mut(&cid).unwrap().mode {
@@ -419,16 +490,16 @@ impl Server {
             Mode::Attached(id) => self.sessions.get(&id).is_some_and(|s| s.alternate_screen()),
         };
         // ?1049l also restores the cursor saved on entering the alternate
-        // screen, so only send it when there is one to leave. Otherwise move
-        // below the session's output for the shell the user returns to.
+        // screen, so only send it when there is one to leave. Then move below
+        // the session's output for the shell the user returns to.
         let leave = if on_alternate_screen {
             "\x1b[?1049l"
         } else {
-            "\r\n"
+            ""
         };
-        let reset = format!("{leave}{}", term::reset());
-        let _ = client.out.send(ServerMsg::Output(reset.into()));
-        let _ = client.out.send(ServerMsg::Exit);
+        let reset = format!("{leave}\r\n{}", term::reset());
+        client.out.post(ServerMsg::Output(reset.into()));
+        client.out.post(ServerMsg::Exit);
     }
 
     fn done(&self) -> bool {
@@ -437,12 +508,12 @@ impl Server {
 }
 
 /// Starts the threads moving messages between a client socket and the
-/// event loop. Returns the sender for messages to the client.
+/// event loop. Returns the sending half of the connection.
 fn spawn_client_threads(
     cid: ClientId,
     stream: UnixStream,
     events: Sender<Event>,
-) -> io::Result<Sender<ServerMsg>> {
+) -> io::Result<Peer> {
     let mut reader = stream.try_clone()?;
     thread::spawn(move || {
         while let Ok(msg) = ClientMsg::read(&mut reader) {
@@ -454,7 +525,11 @@ fn spawn_client_threads(
     });
 
     // A separate writer keeps one slow client from stalling everything else.
-    let (tx, rx) = mpsc::channel::<ServerMsg>();
+    let (tx, rx) = mpsc::sync_channel::<ServerMsg>(CLIENT_QUEUE);
+    let peer = Peer {
+        queue: tx,
+        stream: stream.try_clone()?,
+    };
     let mut writer = stream;
     thread::spawn(move || {
         for msg in rx {
@@ -464,7 +539,7 @@ fn spawn_client_threads(
         }
         let _ = writer.shutdown(std::net::Shutdown::Both);
     });
-    Ok(tx)
+    Ok(peer)
 }
 
 fn bind(path: &Path) -> io::Result<UnixListener> {
@@ -516,13 +591,22 @@ pub fn run() -> io::Result<()> {
             // Read the greeting off the event loop so a silent client
             // cannot block it.
             thread::spawn(move || {
-                if let Ok(ClientMsg::Hello { version, size, cwd }) = ClientMsg::read(&mut stream) {
-                    let _ = tx.send(Event::Connected {
-                        stream,
+                if let Ok(ClientMsg::Hello {
+                    version,
+                    size,
+                    cwd,
+                    token,
+                    resume,
+                }) = ClientMsg::read(&mut stream)
+                {
+                    let hello = Greeting {
                         version,
                         size,
                         cwd,
-                    });
+                        token,
+                        resume,
+                    };
+                    let _ = tx.send(Event::Connected(stream, hello));
                 }
             });
         }
@@ -543,12 +627,7 @@ pub fn run() -> io::Result<()> {
             Event::Output(id, bytes) => server.output(id, &bytes),
             Event::Exited(id) => server.remove(id),
             Event::ChildExited => server.reap_children(),
-            Event::Connected {
-                stream,
-                version,
-                size,
-                cwd,
-            } => server.connect(stream, version, size, cwd),
+            Event::Connected(stream, hello) => server.connect(stream, hello),
             Event::Message(cid, msg) => server.message(cid, msg),
             Event::Disconnected(cid) => {
                 server.clients.remove(&cid);

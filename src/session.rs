@@ -19,7 +19,7 @@ use crate::term::MODE_RESET;
 
 pub type SessionId = u64;
 
-const SCROLLBACK: usize = 10_000;
+pub const SCROLLBACK: usize = 10_000;
 
 pub struct Session {
     pub name: String,
@@ -76,7 +76,7 @@ impl vt100::Callbacks for Alerts {
     }
 }
 
-fn nz(n: u16) -> NonZeroU16 {
+pub fn nz(n: u16) -> NonZeroU16 {
     NonZeroU16::new(n).unwrap_or(NonZeroU16::MIN)
 }
 
@@ -199,49 +199,54 @@ impl Session {
     /// Escape sequences restoring the input modes and cursor visibility the
     /// application inside the session expects.
     pub fn modes(&self) -> String {
-        let screen = self.parser.screen();
-        let cursor = if screen.hide_cursor() {
-            "\x1b[?25l"
-        } else {
-            "\x1b[?25h"
-        };
-        format!("{MODE_RESET}{}{cursor}", screen.input_mode_formatted())
+        modes(self.parser.screen())
     }
 
-    /// Escape sequences that replace the outer terminal's screen and
-    /// scrollback with this session's.
     pub fn repaint(&mut self) -> String {
-        let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[?1049l\x1b[0m\x1b[H\x1b[2J\x1b[3J");
-
-        // Emit the main screen with its scrollback as plain lines, so the
-        // outer terminal scrolls the history into its own scrollback buffer.
-        let alt = self.alternate_screen();
-        if alt {
-            // ?47 switches grids without clearing or touching saved cursors.
-            self.parser.process(b"\x1b[?47l");
-        }
-        let screen = self.parser.screen();
-        let mut text = String::new();
-        let mut state = BasicFormattedCaptureState::new();
-        let _ = screen.write_contents_formatted_basic(
-            &mut text,
-            BasicFormattedCaptureRange::Full(&mut state),
-        );
-        out.push_str(&text.replace('\n', "\r\n"));
-        out.push_str("\x1b[0m");
-        if alt {
-            out.push_str(&screen.cursor_state_formatted());
-            self.parser.process(b"\x1b[?47h");
-            out.push_str("\x1b[?1049h");
-            out.push_str(&self.parser.screen().contents_formatted());
-        } else {
-            out.push_str(&screen.cursor_state_formatted());
-            out.push_str(&screen.attributes_formatted());
-        }
-        out.push_str(&self.modes());
-        out.push_str("\x1b[?2026l");
-        out
+        repaint(&mut self.parser)
     }
+}
+
+pub fn modes(screen: &vt100::Screen) -> String {
+    let cursor = if screen.hide_cursor() {
+        "\x1b[?25l"
+    } else {
+        "\x1b[?25h"
+    };
+    format!("{MODE_RESET}{}{cursor}", screen.input_mode_formatted())
+}
+
+/// Escape sequences that replace the outer terminal's screen and scrollback
+/// with the emulated terminal's. Feeding them to a fresh emulator of the
+/// same size reproduces the state too.
+pub fn repaint<CB: vt100::Callbacks>(parser: &mut vt100::Parser<CB>) -> String {
+    let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[?1049l\x1b[0m\x1b[H\x1b[2J\x1b[3J");
+
+    // Emit the main screen with its scrollback as plain lines, so the outer
+    // terminal scrolls the history into its own scrollback buffer.
+    let alt = parser.screen().alternate_screen();
+    if alt {
+        // ?47 switches grids without clearing or touching saved cursors.
+        parser.process(b"\x1b[?47l");
+    }
+    let screen = parser.screen();
+    let mut text = String::new();
+    let mut state = BasicFormattedCaptureState::new();
+    let _ = screen
+        .write_contents_formatted_basic(&mut text, BasicFormattedCaptureRange::Full(&mut state));
+    out.push_str(&text.replace('\n', "\r\n"));
+    out.push_str("\x1b[0m");
+    out.push_str(&screen.cursor_state_formatted());
+    if alt {
+        parser.process(b"\x1b[?47h");
+        out.push_str("\x1b[?1049h");
+        out.push_str(&parser.screen().contents_formatted());
+    } else {
+        out.push_str(&screen.attributes_formatted());
+    }
+    out.push_str(&modes(parser.screen()));
+    out.push_str("\x1b[?2026l");
+    out
 }
 
 #[cfg(test)]
