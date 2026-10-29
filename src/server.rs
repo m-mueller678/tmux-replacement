@@ -16,7 +16,7 @@ use signal_hook::iterator::Signals;
 
 use crate::menu::{Action, BUILTINS, Item, Menu, Outcome, Target};
 use crate::protocol::{self, ClientMsg, ServerMsg, VERSION};
-use crate::session::{Session, SessionId};
+use crate::session::{Session, SessionId, view_size};
 use crate::{paths, term};
 
 pub enum Event {
@@ -83,6 +83,8 @@ struct Server {
     clients: BTreeMap<ClientId, Client>,
     next_client: ClientId,
     events: Sender<Event>,
+    /// Shown in the clients' status bars.
+    host: String,
     quit: bool,
 }
 
@@ -116,6 +118,7 @@ impl Server {
             out.post(ServerMsg::Exit);
             return;
         }
+        out.post(ServerMsg::Host(self.host.clone()));
         // A reconnecting client replaces the connection it lost.
         self.clients.retain(|_, c| {
             let stale = c.token == hello.token;
@@ -163,7 +166,7 @@ impl Server {
                     let session = self.sessions.get_mut(&id).unwrap();
                     // With several clients on one session, whoever types
                     // decides its size.
-                    session.resize(client.size);
+                    session.resize(view_size(client.size));
                     let split = input.iter().position(|&b| b == PREFIX);
                     let (keys, rest) = input.split_at(split.unwrap_or(input.len()));
                     session.write(keys);
@@ -342,7 +345,7 @@ impl Server {
         let previous = std::mem::replace(&mut client.mode, Mode::Attached(id));
         let session = self.sessions.get_mut(&id).unwrap();
         session.attention = None;
-        let resized = session.resize(client.size);
+        let resized = session.resize(view_size(client.size));
         let replay = match previous {
             Mode::Menu(mut menu)
                 if menu.return_to == Some(id) && !resized && !session.alternate_screen() =>
@@ -389,7 +392,13 @@ impl Server {
             .and_then(|id| self.sessions[&id].cwd())
             .unwrap_or_else(|| client.cwd.clone());
         let id = self.next_session;
-        match Session::spawn(id, name, client.size, Some(cwd), self.events.clone()) {
+        match Session::spawn(
+            id,
+            name,
+            view_size(client.size),
+            Some(cwd),
+            self.events.clone(),
+        ) {
             Ok(session) => {
                 self.next_session += 1;
                 self.sessions.insert(id, session);
@@ -486,7 +495,7 @@ impl Server {
         client.size = size;
         match &client.mode {
             Mode::Attached(id) => {
-                self.sessions.get_mut(id).unwrap().resize(size);
+                self.sessions.get_mut(id).unwrap().resize(view_size(size));
             }
             Mode::Menu(_) => self.render_menu(cid),
         }
@@ -552,6 +561,13 @@ fn spawn_client_threads(
         let _ = writer.shutdown(std::net::Shutdown::Both);
     });
     Ok(peer)
+}
+
+/// The host name up to the first dot, as tmux shows it.
+fn short_hostname() -> String {
+    let name = nix::unistd::gethostname().unwrap_or_default();
+    let name = name.to_string_lossy();
+    name.split('.').next().unwrap_or_default().to_string()
 }
 
 fn bind(path: &Path) -> io::Result<UnixListener> {
@@ -631,6 +647,7 @@ pub fn run() -> io::Result<()> {
         clients: BTreeMap::new(),
         next_client: 0,
         events: tx,
+        host: short_hostname(),
         quit: false,
     };
 

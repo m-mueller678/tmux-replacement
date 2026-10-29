@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 /// Bumped whenever the protocol changes, so a client never talks to a
 /// server from an incompatible build.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -45,6 +45,8 @@ pub enum ServerMsg {
     },
     /// Names of all sessions.
     Sessions(Vec<String>),
+    /// The name of the machine the server runs on, sent first.
+    Host(String),
     /// The client should restore its terminal and exit.
     Exit,
 }
@@ -219,6 +221,7 @@ impl ServerMsg {
                     });
                 frame(4, &p.0)
             }
+            ServerMsg::Host(name) => frame(5, name.as_bytes()),
         }
     }
 
@@ -237,6 +240,7 @@ impl ServerMsg {
                 let n = c.u32()?;
                 ServerMsg::Sessions((0..n).map(|_| c.string()).collect::<io::Result<_>>()?)
             }
+            5 => ServerMsg::Host(String::from_utf8(p).map_err(|_| invalid())?),
             _ => return Err(invalid()),
         })
     }
@@ -291,6 +295,7 @@ mod tests {
         }
         .encode();
         bytes.extend(ServerMsg::Sessions(vec!["a".into(), "b".into()]).encode());
+        bytes.extend(ServerMsg::Host("box".into()).encode());
         let mut r = &bytes[..];
         assert!(matches!(
             ServerMsg::read(&mut r).unwrap(),
@@ -299,5 +304,6 @@ mod tests {
         assert!(
             matches!(ServerMsg::read(&mut r).unwrap(), ServerMsg::Sessions(n) if n == ["a", "b"])
         );
+        assert!(matches!(ServerMsg::read(&mut r).unwrap(), ServerMsg::Host(h) if h == "box"));
     }
 }

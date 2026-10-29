@@ -20,8 +20,8 @@ use signal_hook::iterator::Signals;
 
 use crate::menu::{Action, Item, Menu, Outcome, Target};
 use crate::protocol::{self, ClientMsg, ServerMsg, VERSION};
-use crate::session::{self, SCROLLBACK, nz};
-use crate::{paths, term};
+use crate::session::{self, SCROLLBACK, nz, view_size};
+use crate::{bar, paths, term};
 
 pub enum Server {
     Local,
@@ -169,7 +169,8 @@ fn read_messages(
     let _ = events.send(Event::Lost(generation, reason()));
 }
 
-/// A session as last shown, kept to show it while disconnected.
+/// A copy of a session as last shown: to draw the status bar over it, and
+/// to show it while disconnected.
 struct Cached {
     name: String,
     parser: vt100::Parser,
@@ -188,9 +189,19 @@ struct Client {
     size: (u16, u16),
     /// The session on screen, live or cached; None while in a picker.
     view: Option<String>,
-    /// Most recently shown first. Only kept for remote servers.
+    /// Most recently shown first. For a local server, only the one on
+    /// screen.
     cache: Vec<Cached>,
     offline: Option<Offline>,
+    /// Name of the server's machine, for the status bar.
+    host: String,
+    filter: bar::Filter,
+    /// Whether the status bar needs drawing.
+    bar_dirty: bool,
+    /// Whether the status bar was drawn, so it needs clearing on exit.
+    bar_shown: bool,
+    /// Whether the session needs repainting from the local copy.
+    repaint: bool,
     quit: bool,
     detached: bool,
 }
@@ -220,13 +231,23 @@ impl Client {
         if !self.established {
             self.established = true;
             if self.offline.take().is_some() {
+                self.release_rows();
                 self.view = None;
             }
         }
         match msg {
-            ServerMsg::Output(bytes) => term::write(&bytes),
-            ServerMsg::SessionOutput(bytes) => {
+            ServerMsg::Output(bytes) => {
                 term::write(&bytes);
+                // Possibly the return from the picker to the session's
+                // screen, which needs its bar back.
+                if self.view.is_some() {
+                    self.bar_dirty = true;
+                    self.update_bar();
+                }
+            }
+            ServerMsg::SessionOutput(bytes) => {
+                let rows = view_size(self.size).0;
+                term::write(&self.filter.process(&bytes, rows));
                 if let Some(cached) = self
                     .cache
                     .first_mut()
@@ -234,9 +255,10 @@ impl Client {
                 {
                     cached.parser.process(&bytes);
                 }
+                self.update_bar();
             }
             ServerMsg::View { session, fresh } => {
-                if let (true, Some(name)) = (self.remote(), &session) {
+                if let Some(name) = &session {
                     let existing = self.cache.iter().position(|c| &c.name == name);
                     let cached = match existing {
                         Some(i) if !fresh => self.cache.remove(i),
@@ -244,7 +266,7 @@ impl Client {
                             if let Some(i) = existing {
                                 self.cache.remove(i);
                             }
-                            let (rows, cols) = self.size;
+                            let (rows, cols) = view_size(self.size);
                             Cached {
                                 name: name.clone(),
                                 parser: vt100::Parser::new(nz(rows), nz(cols), SCROLLBACK),
@@ -252,10 +274,18 @@ impl Client {
                         }
                     };
                     self.cache.insert(0, cached);
+                    // Only a remote server's sessions are shown offline.
+                    if !self.remote() {
+                        self.cache.truncate(1);
+                    }
+                    self.claim_rows();
+                } else {
+                    self.release_rows();
                 }
                 self.view = session;
             }
             ServerMsg::Sessions(names) => self.cache.retain(|c| names.contains(&c.name)),
+            ServerMsg::Host(name) => self.host = name,
             ServerMsg::Exit => {
                 self.detached = true;
                 self.quit = true;
@@ -339,15 +369,85 @@ impl Client {
                 menu.set_message(status);
                 term::write(menu.render(size).as_bytes());
             }
-            None => {
-                let (rows, cols) = size;
-                let text = format!(" {status} · ctrl-b: sessions seen so far ");
-                let text: String = text.chars().take(cols as usize).collect();
-                // Overwrites the bottom row until the reconnect repaints it.
-                let line = format!("\x1b7\x1b[{rows};1H\x1b[0;7m{text}\x1b[K\x1b[0m\x1b8");
-                term::write(line.as_bytes());
-            }
+            // The status bar turns red.
+            None => self.draw_bar(),
         }
+    }
+
+    fn current(&self) -> Option<&Cached> {
+        self.cache
+            .first()
+            .filter(|c| Some(&c.name) == self.view.as_ref())
+    }
+
+    /// Whether the terminal has a row to spare for the status bar.
+    fn has_bar(&self) -> bool {
+        view_size(self.size).0 < self.size.0
+    }
+
+    /// Confines what follows to the rows above the status bar. Sent before
+    /// a session's screen is drawn, so its history scrolls into the
+    /// terminal's scrollback without the bar.
+    fn claim_rows(&mut self) {
+        self.filter = bar::Filter::default();
+        self.bar_dirty = true;
+        if self.has_bar() {
+            let rows = view_size(self.size).0;
+            term::write(format!("\x1b[1;{rows}r").as_bytes());
+        }
+    }
+
+    /// Gives the whole screen back to a picker about to open.
+    fn release_rows(&self) {
+        let Some(cached) = self.current() else {
+            return;
+        };
+        // Resetting the region homes the cursor. Put it back, for the
+        // picker's alternate screen to save and restore.
+        let cursor = cached.parser.screen().cursor_state_formatted();
+        term::write(format!("\x1b[r{cursor}").as_bytes());
+    }
+
+    /// Catches up with what session output did to the status bar, unless
+    /// the output so far ends inside a character or escape sequence.
+    fn update_bar(&mut self) {
+        self.bar_dirty |= self.filter.take_damage();
+        if !self.filter.at_boundary() {
+            return;
+        }
+        if std::mem::take(&mut self.repaint) {
+            if let Some(i) = self
+                .cache
+                .iter()
+                .position(|c| Some(&c.name) == self.view.as_ref())
+            {
+                self.show_cached(i);
+            }
+        } else if self.bar_dirty {
+            self.draw_bar();
+        }
+    }
+
+    fn draw_bar(&mut self) {
+        let (rows, cols) = self.size;
+        let Some(cached) = self.current().filter(|_| self.has_bar()) else {
+            return;
+        };
+        let screen = cached.parser.screen();
+        let (top, bottom) = self.filter.region(rows - 1);
+        // Black on green, or on red while disconnected.
+        let color = if self.offline.is_some() { 41 } else { 42 };
+        let text = bar::text(&cached.name, &self.host, cols);
+        // Setting the region homes the cursor; the session's cursor and
+        // colors come back last.
+        let out = format!(
+            "\x1b[{top};{bottom}r\x1b[{rows};1H\x1b[0;30;{color}m{text}\x1b[0m{}{}",
+            screen.cursor_state_formatted(),
+            screen.attributes_formatted()
+        );
+        term::write(out.as_bytes());
+        self.bar_dirty = false;
+        self.bar_shown = true;
     }
 
     fn open_offline_menu(&mut self) {
@@ -379,6 +479,7 @@ impl Client {
             note: Some("quit; remote sessions keep running".into()),
             alert: false,
         });
+        self.release_rows();
         term::write(format!("\x1b[?1049h{}", term::MODE_RESET).as_bytes());
         if let Some(offline) = &mut self.offline {
             offline.menu = Some(Menu::new(None, items));
@@ -386,16 +487,17 @@ impl Client {
         self.draw_offline();
     }
 
-    /// Repaints a cached session from the local copy.
+    /// Repaints a session from the local copy.
     fn show_cached(&mut self, i: usize) {
         let mut cached = self.cache.remove(i);
+        self.claim_rows();
         term::write(session::repaint(&mut cached.parser).as_bytes());
         self.view = Some(cached.name.clone());
         self.cache.insert(0, cached);
         if let Some(offline) = &mut self.offline {
             offline.menu = None;
         }
-        self.draw_offline();
+        self.draw_bar();
     }
 
     fn input(&mut self, mut input: &[u8]) {
@@ -446,12 +548,19 @@ impl Client {
 
     fn resize(&mut self) {
         self.size = term::size();
-        let (rows, cols) = self.size;
+        let (rows, cols) = view_size(self.size);
         for cached in &mut self.cache {
             cached.parser.set_size(nz(rows), nz(cols));
         }
         if let (Some(conn), None) = (&mut self.conn, &self.offline) {
             conn.send(ClientMsg::Resize(self.size));
+            // Terminals rearrange their contents on resize in their own
+            // ways. Redraw the session from the local copy to match it,
+            // with the bar in its new place.
+            if self.view.is_some() {
+                self.repaint = true;
+                self.update_bar();
+            }
             return;
         }
         let showing_cached = self.offline.as_ref().is_some_and(|o| o.menu.is_none());
@@ -479,6 +588,11 @@ pub fn run(server: Server) -> io::Result<()> {
         view: None,
         cache: Vec::new(),
         offline: None,
+        host: String::new(),
+        filter: bar::Filter::default(),
+        bar_dirty: false,
+        bar_shown: false,
+        repaint: false,
         quit: false,
         detached: false,
     };
@@ -550,7 +664,15 @@ pub fn run(server: Server) -> io::Result<()> {
         if client.offline.as_ref().is_some_and(|o| o.menu.is_some()) {
             term::write(b"\x1b[?1049l");
         }
-        fallback_cleanup();
+        term::write(b"\x1b[?1047l");
+    }
+    if client.bar_shown {
+        // Clear the bar and give the shell the whole screen back.
+        let rows = client.size.0;
+        term::write(format!("\x1b7\x1b[{rows};1H\x1b[0m\x1b[2K\x1b[r\x1b8").as_bytes());
+    }
+    if !client.detached {
+        term::write(format!("{}\r\n", term::reset()).as_bytes());
     }
     term::restore_mode();
     Ok(())
@@ -586,10 +708,10 @@ fn random_token() -> u64 {
     u64::from_le_bytes(bytes) ^ u64::from(std::process::id())
 }
 
-/// Used when the server did not get to clean up the terminal. Unlike
-/// ?1049l, ?1047l leaves the cursor alone when not on the alternate screen.
+/// Used when the client panics. Unlike ?1049l, ?1047l leaves the cursor
+/// alone when not on the alternate screen.
 fn fallback_cleanup() {
-    term::write(format!("\x1b[?1047l{}\r\n", term::reset()).as_bytes());
+    term::write(format!("\x1b[?1047l\x1b7\x1b[r\x1b8{}\r\n", term::reset()).as_bytes());
 }
 
 fn connect_or_start(path: &Path) -> io::Result<UnixStream> {

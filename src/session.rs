@@ -76,6 +76,12 @@ impl vt100::Callbacks for Alerts {
     }
 }
 
+/// The size a session gets in a terminal of `size`: the bottom row is left
+/// for the status bar.
+pub fn view_size((rows, cols): (u16, u16)) -> (u16, u16) {
+    (if rows > 1 { rows - 1 } else { rows }, cols)
+}
+
 pub fn nz(n: u16) -> NonZeroU16 {
     NonZeroU16::new(n).unwrap_or(NonZeroU16::MIN)
 }

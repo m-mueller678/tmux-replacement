@@ -1,3 +1,4 @@
+mod bar;
 mod client;
 mod menu;
 mod paths;
