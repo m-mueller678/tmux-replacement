@@ -25,10 +25,9 @@ use crate::{bar, paths, term};
 
 pub enum Server {
     Local,
-    /// Reached through `ssh <destination> <bin> --proxy`.
+    /// Reached through `ssh <destination> tmux-replacement --proxy`.
     Remote {
         destination: String,
-        bin: String,
     },
 }
 
@@ -88,7 +87,7 @@ fn connect(
                 }),
             })
         }
-        Server::Remote { destination, bin } => {
+        Server::Remote { destination } => {
             let mut cmd = Command::new("ssh");
             // Notice a dead network within ~15s instead of the TCP timeout.
             cmd.args([
@@ -102,7 +101,7 @@ fn connect(
                 // Nobody can answer a prompt in the middle of the session.
                 cmd.args(["-o", "BatchMode=yes"]);
             }
-            cmd.args(["--", destination, bin, "--proxy"])
+            cmd.args(["--", destination, "tmux-replacement", "--proxy"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(if interactive {

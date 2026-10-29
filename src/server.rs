@@ -17,7 +17,7 @@ use signal_hook::iterator::Signals;
 use crate::menu::{Action, BUILTINS, Item, Menu, Outcome, Target};
 use crate::protocol::{self, ClientMsg, PACKAGE_VERSION, ServerMsg, VERSION};
 use crate::session::{Session, SessionId, view_size};
-use crate::{paths, term};
+use crate::{hosts, paths, term};
 
 pub enum Event {
     Output(SessionId, Vec<u8>),
@@ -566,13 +566,6 @@ fn spawn_client_threads(
     Ok(peer)
 }
 
-/// The host name up to the first dot, as tmux shows it.
-fn short_hostname() -> String {
-    let name = nix::unistd::gethostname().unwrap_or_default();
-    let name = name.to_string_lossy();
-    name.split('.').next().unwrap_or_default().to_string()
-}
-
 fn bind(path: &Path) -> io::Result<UnixListener> {
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
@@ -656,7 +649,7 @@ pub fn run() -> io::Result<()> {
         clients: BTreeMap::new(),
         next_client: 0,
         events: tx,
-        host: short_hostname(),
+        host: hosts::short_hostname(),
         quit: false,
     };
 
