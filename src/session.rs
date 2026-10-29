@@ -25,7 +25,55 @@ pub struct Session {
     pub name: String,
     pub pid: i32,
     master: File,
-    parser: vt100::Parser,
+    parser: vt100::Parser<Alerts>,
+    /// Why the session wants the user's attention, while nobody looked yet.
+    pub attention: Option<String>,
+}
+
+/// Requests for the user's attention found in a session's output.
+#[derive(Default)]
+pub struct Alerts {
+    pub bell: bool,
+    pub notifications: Vec<Notification>,
+}
+
+/// A desktop notification escape sequence (OSC 9, 777 or 99).
+pub struct Notification {
+    pub text: String,
+    /// The sequence re-encoded, for forwarding to the outer terminal.
+    pub sequence: Vec<u8>,
+}
+
+impl vt100::Callbacks for Alerts {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bell = true;
+    }
+
+    fn visual_bell(&mut self, _: &mut vt100::Screen) {
+        self.bell = true;
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        let text = match params {
+            // ConEmu's progress reporting shares OSC 9 but is no request.
+            [b"9", b"4", ..] => return,
+            [b"9", message @ ..] => message.join(&b';'),
+            [b"777", b"notify", title, body @ ..] => {
+                [title.to_vec(), body.join(&b';')].join(&b": "[..])
+            }
+            // Kitty: the payload is last, after the metadata.
+            [b"99", .., payload] => payload.to_vec(),
+            _ => return,
+        };
+        let text = String::from_utf8_lossy(&text)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let mut sequence = b"\x1b]".to_vec();
+        sequence.extend(params.join(&b';'));
+        sequence.push(0x07);
+        self.notifications.push(Notification { text, sequence });
+    }
 }
 
 fn nz(n: u16) -> NonZeroU16 {
@@ -103,7 +151,13 @@ impl Session {
             name,
             pid: child.id() as i32,
             master,
-            parser: vt100::Parser::new(nz(size.0), nz(size.1), SCROLLBACK),
+            parser: vt100::Parser::new_with_callbacks(
+                nz(size.0),
+                nz(size.1),
+                SCROLLBACK,
+                Alerts::default(),
+            ),
+            attention: None,
         })
     }
 
@@ -111,8 +165,9 @@ impl Session {
         let _ = self.master.write_all(bytes);
     }
 
-    pub fn process(&mut self, bytes: &[u8]) {
+    pub fn process(&mut self, bytes: &[u8]) -> Alerts {
         self.parser.process(bytes);
+        std::mem::take(self.parser.callbacks_mut())
     }
 
     pub fn alternate_screen(&self) -> bool {
@@ -186,5 +241,33 @@ impl Session {
         out.push_str(&self.modes());
         out.push_str("\x1b[?2026l");
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alerts(bytes: &[u8]) -> Alerts {
+        let mut parser = vt100::Parser::new_with_callbacks(nz(24), nz(80), 0, Alerts::default());
+        parser.process(bytes);
+        std::mem::take(parser.callbacks_mut())
+    }
+
+    #[test]
+    fn detects_attention_requests() {
+        assert!(alerts(b"done\x07").bell);
+        assert!(!alerts(b"\x1b]0;title\x07").bell);
+
+        let n = alerts(b"\x1b]9;build; done\x07").notifications;
+        assert_eq!(n[0].text, "build; done");
+        assert_eq!(n[0].sequence, b"\x1b]9;build; done\x07");
+        let n = alerts(b"\x1b]777;notify;make;finished\x1b\\").notifications;
+        assert_eq!(n[0].text, "make: finished");
+        assert_eq!(
+            alerts(b"\x1b]99;i=1;hello\x07").notifications[0].text,
+            "hello"
+        );
+        assert!(alerts(b"\x1b]9;4;1;50\x07").notifications.is_empty());
     }
 }

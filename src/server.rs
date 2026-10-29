@@ -197,8 +197,10 @@ impl Server {
             order.swap(0, 1);
         }
         let sessions = order.into_iter().map(|id| {
-            let name = &self.sessions[&id].name;
+            let session = &self.sessions[&id];
+            let name = &session.name;
             let builtin = BUILTINS.iter().any(|(b, ..)| b == name);
+            let current = (Some(id) == return_to).then(|| "(current)".to_string());
             Item {
                 label: if builtin {
                     format!("s#{name}")
@@ -206,13 +208,15 @@ impl Server {
                     name.clone()
                 },
                 target: Target::Session(id),
-                note: (Some(id) == return_to).then(|| "(current)".into()),
+                note: session.attention.clone().or(current),
+                alert: session.attention.is_some(),
             }
         });
         let actions = BUILTINS.iter().map(|(name, action, note)| Item {
             label: name.to_string(),
             target: Target::Action(*action),
             note: Some(note.to_string()),
+            alert: false,
         });
         sessions.chain(actions).collect()
     }
@@ -265,6 +269,7 @@ impl Server {
         };
         let previous = std::mem::replace(&mut client.mode, Mode::Attached(id));
         let session = self.sessions.get_mut(&id).unwrap();
+        session.attention = None;
         let resized = session.resize(client.size);
         let replay = match previous {
             Mode::Menu(mut menu)
@@ -318,7 +323,28 @@ impl Server {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        session.process(bytes);
+        let alerts = session.process(bytes);
+        let viewed = self
+            .clients
+            .values()
+            .any(|c| matches!(c.mode, Mode::Attached(a) if a == id));
+        if !viewed && (alerts.bell || !alerts.notifications.is_empty()) {
+            // Flag the session in the picker, and pass the request on so the
+            // desktop can still highlight the terminal.
+            let mut forward = Vec::new();
+            if alerts.bell {
+                session.attention = Some("bell".into());
+                forward.push(0x07);
+            }
+            for notification in alerts.notifications {
+                session.attention = Some(notification.text);
+                forward.extend(notification.sequence);
+            }
+            for client in self.clients.values() {
+                let _ = client.out.send(ServerMsg::Output(forward.clone()));
+            }
+            self.refresh_menus();
+        }
         for client in self.clients.values_mut() {
             match &mut client.mode {
                 Mode::Attached(active) if *active == id => {

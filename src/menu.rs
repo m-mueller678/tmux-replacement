@@ -34,8 +34,10 @@ pub enum Target {
 pub struct Item {
     pub label: String,
     pub target: Target,
-    /// Dimmed text shown after the label.
+    /// Text shown after the label.
     pub note: Option<String>,
+    /// The session asked for attention; highlighted along with its note.
+    pub alert: bool,
 }
 
 pub enum Outcome {
@@ -171,9 +173,21 @@ impl Menu {
         menu
     }
 
+    /// Replaces the entries, keeping the selection on the same target.
     pub fn set_items(&mut self, items: Vec<Item>) {
+        let selected = self
+            .matches
+            .get(self.selected)
+            .map(|(i, _)| self.items[*i].target);
         self.items = items;
         self.refilter();
+        if let Some(n) = self
+            .matches
+            .iter()
+            .position(|(i, _)| Some(self.items[*i].target) == selected)
+        {
+            self.selected = n;
+        }
     }
 
     pub fn forget_return_target(&mut self) {
@@ -337,6 +351,8 @@ impl Menu {
             } else {
                 "  "
             });
+            let base = if item.alert { "\x1b[1;33m" } else { "" };
+            out.push_str(base);
             let mut used = 2;
             for (ci, c) in item.label.chars().enumerate() {
                 let w = c.width().unwrap_or(0);
@@ -347,7 +363,7 @@ impl Menu {
                 if positions.contains(&ci) {
                     out.push_str("\x1b[32m");
                     out.push(c);
-                    out.push_str("\x1b[39m");
+                    out.push_str(if item.alert { "\x1b[33m" } else { "\x1b[39m" });
                 } else {
                     out.push(c);
                 }
@@ -355,7 +371,8 @@ impl Menu {
             if let Some(note) = &item.note {
                 let note = truncate(note, cols.saturating_sub(used + 2));
                 if !note.is_empty() {
-                    let _ = write!(out, "  \x1b[2m{note}");
+                    let style = if item.alert { "\x1b[22;33m" } else { "\x1b[2m" };
+                    let _ = write!(out, "  {style}{note}");
                 }
             }
             out.push_str("\x1b[0m");
@@ -471,11 +488,13 @@ mod tests {
                 label: "work".into(),
                 target: Target::Session(1),
                 note: None,
+                alert: false,
             },
             Item {
                 label: "new".into(),
                 target: Target::Action(Action::New),
                 note: None,
+                alert: false,
             },
         ];
         let mut menu = Menu::new(Some(1), items);
