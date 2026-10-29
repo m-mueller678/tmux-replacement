@@ -19,7 +19,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
 use crate::menu::{Action, Item, Menu, Outcome, Target};
-use crate::protocol::{self, ClientMsg, ServerMsg, VERSION};
+use crate::protocol::{self, ClientMsg, PACKAGE_VERSION, ServerMsg, VERSION};
 use crate::session::{self, SCROLLBACK, nz, view_size};
 use crate::{bar, paths, term};
 
@@ -204,6 +204,8 @@ struct Client {
     repaint: bool,
     quit: bool,
     detached: bool,
+    /// Why the client quit, if it failed.
+    error: Option<String>,
 }
 
 struct Offline {
@@ -286,6 +288,14 @@ impl Client {
             }
             ServerMsg::Sessions(names) => self.cache.retain(|c| names.contains(&c.name)),
             ServerMsg::Host(name) => self.host = name,
+            // Can only happen on reconnecting; there is no asking here.
+            ServerMsg::Mismatch { protocol, version } => {
+                self.error = Some(format!(
+                    "the server was replaced by version {version} (protocol {protocol}); \
+                     run again to replace it"
+                ));
+                self.quit = true;
+            }
             ServerMsg::Exit => {
                 self.detached = true;
                 self.quit = true;
@@ -595,17 +605,48 @@ pub fn run(server: Server) -> io::Result<()> {
         repaint: false,
         quit: false,
         detached: false,
+        error: None,
     };
-    let mut conn = connect(&client.server, 0, tx.clone(), true)?;
-    conn.send(client.hello());
-    client.conn = Some(conn);
 
     // Wait until the server answers before taking over the terminal, so
-    // ssh can still ask for a password.
-    let first = match rx.recv() {
-        Ok(Event::Message(_, msg)) => msg,
-        Ok(Event::Lost(_, reason)) => return Err(io::Error::other(reason)),
-        _ => return Err(io::Error::other("connection failed")),
+    // ssh can still ask for a password, and a server from another version
+    // can be replaced after asking.
+    let mut replaced = false;
+    let first = loop {
+        let mut conn = connect(&client.server, client.generation, tx.clone(), true)?;
+        conn.send(client.hello());
+        client.conn = Some(conn);
+        let msg = loop {
+            match rx.recv() {
+                Ok(Event::Message(g, msg)) if g == client.generation => break msg,
+                Ok(Event::Lost(g, reason)) if g == client.generation => {
+                    return Err(io::Error::other(reason));
+                }
+                Ok(_) => {}
+                Err(_) => return Err(io::Error::other("connection failed")),
+            }
+        };
+        let ServerMsg::Mismatch { protocol, version } = msg else {
+            break msg;
+        };
+        client.conn = None;
+        client.generation += 1;
+        let ours = format!("{PACKAGE_VERSION} (protocol {VERSION})");
+        let theirs = format!("{version} (protocol {protocol})");
+        if replaced {
+            return Err(io::Error::other(format!(
+                "the newly started server is version {theirs} but this client is {ours}; \
+                 install the same version on both ends"
+            )));
+        }
+        if !confirm(&format!(
+            "The running server is version {theirs}, this client is {ours}.\n\
+             Kill the server, ending all its sessions? [y/N] "
+        ))? {
+            return Err(io::Error::other("server version mismatch"));
+        }
+        kill(&client.server)?;
+        replaced = true;
     };
     term::enable_raw_mode().map_err(io::Error::from)?;
     let default_hook = std::panic::take_hook();
@@ -675,7 +716,53 @@ pub fn run(server: Server) -> io::Result<()> {
         term::write(format!("{}\r\n", term::reset()).as_bytes());
     }
     term::restore_mode();
-    Ok(())
+    match client.error {
+        Some(e) => Err(io::Error::other(e)),
+        None => Ok(()),
+    }
+}
+
+fn confirm(question: &str) -> io::Result<bool> {
+    eprint!("{question}");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// Ends the server and all its sessions, whichever version it is. Returns
+/// whether one was running, as far as can be told.
+pub fn kill(server: &Server) -> io::Result<bool> {
+    match server {
+        Server::Local => {
+            let path = paths::socket_path()?;
+            let Ok(mut stream) = UnixStream::connect(&path) else {
+                return Ok(false);
+            };
+            protocol::send(&mut stream, &ClientMsg::KillServer.encode())?;
+            // The server closes the connection when it exits.
+            let _ = io::copy(&mut stream, &mut io::sink());
+            // Servers from before KillServer existed just hang up.
+            if UnixStream::connect(&path).is_ok() {
+                return Err(io::Error::other(
+                    "the server is too old to be killed this way; \
+                     run: pkill -f 'tmux-replacement --server'",
+                ));
+            }
+            Ok(true)
+        }
+        Server::Remote { .. } => {
+            let (tx, rx) = mpsc::channel();
+            let mut conn = connect(server, 0, tx, true)?;
+            conn.send(ClientMsg::KillServer);
+            // ssh exits once the proxy sees the server close the connection.
+            while let Ok(event) = rx.recv() {
+                if let Event::Lost(..) = event {
+                    break;
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// Bytes the remote proxy relays between ssh and the local server socket.

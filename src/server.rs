@@ -15,7 +15,7 @@ use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::menu::{Action, BUILTINS, Item, Menu, Outcome, Target};
-use crate::protocol::{self, ClientMsg, ServerMsg, VERSION};
+use crate::protocol::{self, ClientMsg, PACKAGE_VERSION, ServerMsg, VERSION};
 use crate::session::{Session, SessionId, view_size};
 use crate::{paths, term};
 
@@ -113,9 +113,11 @@ impl Server {
             return;
         };
         if hello.version != VERSION {
-            let msg = "the running server is from a different version; end its sessions and kill it first\r\n";
-            out.post(ServerMsg::Output(msg.into()));
-            out.post(ServerMsg::Exit);
+            // Dropping `out` closes the connection after this.
+            out.post(ServerMsg::Mismatch {
+                protocol: VERSION,
+                version: PACKAGE_VERSION.into(),
+            });
             return;
         }
         out.post(ServerMsg::Host(self.host.clone()));
@@ -150,6 +152,7 @@ impl Server {
     fn message(&mut self, cid: ClientId, msg: ClientMsg) {
         match msg {
             ClientMsg::Hello { .. } => {}
+            ClientMsg::KillServer => self.quit = true,
             ClientMsg::Input(bytes) => self.handle_input(cid, &bytes),
             ClientMsg::Resize(size) => self.resize_client(cid, size),
         }
@@ -618,15 +621,14 @@ pub fn run() -> io::Result<()> {
             let tx = accept_tx.clone();
             // Read the greeting off the event loop so a silent client
             // cannot block it.
-            thread::spawn(move || {
-                if let Ok(ClientMsg::Hello {
+            thread::spawn(move || match ClientMsg::read(&mut stream) {
+                Ok(ClientMsg::Hello {
                     version,
                     size,
                     cwd,
                     token,
                     resume,
-                }) = ClientMsg::read(&mut stream)
-                {
+                }) => {
                     let hello = Greeting {
                         version,
                         size,
@@ -636,6 +638,13 @@ pub fn run() -> io::Result<()> {
                     };
                     let _ = tx.send(Event::Connected(stream, hello));
                 }
+                Ok(ClientMsg::KillServer) => {
+                    // Keep the connection open until the process exits, so
+                    // the client sees it close once the server is gone.
+                    std::mem::forget(stream);
+                    let _ = tx.send(Event::Quit);
+                }
+                _ => {}
             });
         }
     });

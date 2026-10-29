@@ -3,6 +3,17 @@
 //!
 //! Each frame is a tag byte, a little-endian u32 payload length and the
 //! payload.
+//!
+//! So that any client can recognize and replace a server from another
+//! build, these parts never change:
+//! - the frame layout;
+//! - the client's Hello (tag 0) starts with the protocol version as a u32;
+//! - a server answers a Hello with another version by [`ServerMsg::Mismatch`]
+//!   (tag 255: u32 protocol version, then its package version as a u32
+//!   length and UTF-8 bytes) and closes the connection;
+//! - a server receiving [`ClientMsg::KillServer`] (tag 255, empty) as the
+//!   first or any later frame ends its sessions and exits, closing the
+//!   connection only once it is gone.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -11,7 +22,12 @@ use std::path::PathBuf;
 
 /// Bumped whenever the protocol changes, so a client never talks to a
 /// server from an incompatible build.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+
+/// The version of this build, for telling the user which servers mismatch.
+pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const STABLE_TAG: u8 = 255;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -28,6 +44,8 @@ pub enum ClientMsg {
     },
     Input(Vec<u8>),
     Resize((u16, u16)),
+    /// Ends the server and all its sessions. Stable across versions.
+    KillServer,
 }
 
 pub enum ServerMsg {
@@ -49,6 +67,9 @@ pub enum ServerMsg {
     Host(String),
     /// The client should restore its terminal and exit.
     Exit,
+    /// Answers a Hello with a different protocol version. Stable across
+    /// versions.
+    Mismatch { protocol: u32, version: String },
 }
 
 fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
@@ -167,6 +188,7 @@ impl ClientMsg {
             }
             ClientMsg::Input(bytes) => frame(1, bytes),
             ClientMsg::Resize((rows, cols)) => frame(2, &Fields::default().u16(*rows).u16(*cols).0),
+            ClientMsg::KillServer => frame(STABLE_TAG, &[]),
         }
     }
 
@@ -196,6 +218,7 @@ impl ClientMsg {
             }
             1 => ClientMsg::Input(p),
             2 => ClientMsg::Resize((c.u16()?, c.u16()?)),
+            STABLE_TAG => ClientMsg::KillServer,
             _ => return Err(invalid()),
         })
     }
@@ -222,6 +245,10 @@ impl ServerMsg {
                 frame(4, &p.0)
             }
             ServerMsg::Host(name) => frame(5, name.as_bytes()),
+            ServerMsg::Mismatch { protocol, version } => frame(
+                STABLE_TAG,
+                &Fields::default().u32(*protocol).bytes(version.as_bytes()).0,
+            ),
         }
     }
 
@@ -241,6 +268,10 @@ impl ServerMsg {
                 ServerMsg::Sessions((0..n).map(|_| c.string()).collect::<io::Result<_>>()?)
             }
             5 => ServerMsg::Host(String::from_utf8(p).map_err(|_| invalid())?),
+            STABLE_TAG => ServerMsg::Mismatch {
+                protocol: c.u32()?,
+                version: c.string()?,
+            },
             _ => return Err(invalid()),
         })
     }
@@ -266,6 +297,7 @@ mod tests {
         };
         let mut bytes = hello.encode();
         bytes.extend(ClientMsg::Resize((3, 4)).encode());
+        bytes.extend(ClientMsg::KillServer.encode());
         let mut r = &bytes[..];
         match ClientMsg::read(&mut r).unwrap() {
             ClientMsg::Hello {
@@ -287,7 +319,21 @@ mod tests {
             ClientMsg::read(&mut r).unwrap(),
             ClientMsg::Resize((3, 4))
         ));
+        assert!(matches!(
+            ClientMsg::read(&mut r).unwrap(),
+            ClientMsg::KillServer
+        ));
         assert!(ClientMsg::read(&mut r).is_err());
+        // The stable frames, byte for byte.
+        assert_eq!(ClientMsg::KillServer.encode(), [255, 0, 0, 0, 0]);
+        let mismatch = ServerMsg::Mismatch {
+            protocol: 7,
+            version: "1.2".into(),
+        };
+        assert_eq!(
+            mismatch.encode(),
+            [255, 11, 0, 0, 0, 7, 0, 0, 0, 3, 0, 0, 0, b'1', b'.', b'2']
+        );
 
         let mut bytes = ServerMsg::View {
             session: Some("a".into()),
