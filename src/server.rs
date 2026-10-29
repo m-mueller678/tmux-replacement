@@ -324,6 +324,18 @@ impl Server {
     }
 
     fn attach(&mut self, cid: ClientId, id: SessionId) {
+        // Terminals of different sizes can't share a session well, so the
+        // client attaching takes over and any others drop back to the picker.
+        let displaced: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|&(&other, c)| other != cid && matches!(c.mode, Mode::Attached(a) if a == id))
+            .map(|(&other, _)| other)
+            .collect();
+        for other in displaced {
+            self.open_menu(other, Some(id));
+            self.menu_message(other, "another client attached".into());
+        }
         let Some(client) = self.clients.get_mut(&cid) else {
             return;
         };
