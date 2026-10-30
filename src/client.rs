@@ -13,7 +13,7 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
@@ -173,6 +173,8 @@ fn read_messages(
 struct Cached {
     name: String,
     parser: vt100::Parser,
+    /// When the server last sent output for it.
+    updated: SystemTime,
 }
 
 struct Client {
@@ -255,6 +257,7 @@ impl Client {
                     .filter(|c| Some(&c.name) == self.view.as_ref())
                 {
                     cached.parser.process(&bytes);
+                    cached.updated = SystemTime::now();
                 }
                 self.update_bar();
             }
@@ -271,6 +274,7 @@ impl Client {
                             Cached {
                                 name: name.clone(),
                                 parser: vt100::Parser::new(nz(rows), nz(cols), SCROLLBACK),
+                                updated: SystemTime::now(),
                             }
                         }
                     };
@@ -446,7 +450,14 @@ impl Client {
         let (top, bottom) = self.filter.region(rows - 1);
         // Black on green, or on red while disconnected.
         let color = if self.offline.is_some() { 41 } else { 42 };
-        let text = bar::text(&cached.name, &self.host, cols);
+        let left = match self.offline {
+            Some(_) => {
+                let updated = bar::timestamp(cached.updated, SystemTime::now());
+                format!("{} · last update {updated}", cached.name)
+            }
+            None => cached.name.clone(),
+        };
+        let text = bar::text(&left, &self.host, cols);
         // Setting the region homes the cursor; the session's cursor and
         // colors come back last.
         let out = format!(

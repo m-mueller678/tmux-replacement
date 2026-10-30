@@ -5,6 +5,8 @@
 //! session in the rows above the bar, and [`Filter`] adjusts the few
 //! sequences that would otherwise reach or erase it.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -201,14 +203,14 @@ impl Filter {
     }
 }
 
-/// The bar's text, exactly `cols` columns wide: the session on the left,
-/// the host on the right.
-pub fn text(session: &str, host: &str, cols: u16) -> String {
+/// The bar's text, exactly `cols` columns wide: `left` (the session) on the
+/// left, the host on the right.
+pub fn text(left: &str, host: &str, cols: u16) -> String {
     let cols = cols as usize;
     let width = |s: &str| s.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
     let mut text = String::new();
     let mut used = 0;
-    for c in format!(" {session}").chars() {
+    for c in format!(" {left}").chars() {
         let w = c.width().unwrap_or(0);
         if used + w > cols {
             break;
@@ -226,6 +228,30 @@ pub fn text(session: &str, host: &str, cols: u16) -> String {
     text.extend(std::iter::repeat_n(' ', gap));
     text.push_str(&right);
     text
+}
+
+/// `when` in local time: the time of day, with the date unless it is the
+/// same day as `now`.
+pub fn timestamp(when: SystemTime, now: SystemTime) -> String {
+    let (w, n) = (local_time(when), local_time(now));
+    let time = format!("{:02}:{:02}:{:02}", w.tm_hour, w.tm_min, w.tm_sec);
+    if (w.tm_year, w.tm_yday) == (n.tm_year, n.tm_yday) {
+        time
+    } else {
+        let date = format!("{}-{:02}-{:02}", w.tm_year + 1900, w.tm_mon + 1, w.tm_mday);
+        format!("{date} {time}")
+    }
+}
+
+fn local_time(t: SystemTime) -> libc::tm {
+    let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as libc::time_t;
+    // SAFETY: localtime_r only writes to the tm it is given, which is plain
+    // integers and a pointer that may be null.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        tm
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +290,16 @@ mod tests {
         assert!(!f.at_boundary());
         f.process(b"x\x1b\\", 23);
         assert!(f.at_boundary());
+    }
+
+    #[test]
+    fn formats_timestamps() {
+        let now = SystemTime::now();
+        let today = timestamp(now, now);
+        assert_eq!(today.len(), 8, "{today}");
+        let old = timestamp(now - std::time::Duration::from_secs(3 * 86400), now);
+        assert_eq!(old.len(), 19, "{old}");
+        assert!(old.ends_with(&today[2..]), "{old} {today}");
     }
 
     #[test]
