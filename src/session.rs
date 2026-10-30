@@ -78,9 +78,10 @@ impl vt100::Callbacks for Alerts {
 }
 
 /// The size a session gets in a terminal of `size`: the bottom row is left
-/// for the status bar.
+/// for the status bar, and it is at least two columns wide.
 pub fn view_size((rows, cols): (u16, u16)) -> (u16, u16) {
-    (if rows > 1 { rows - 1 } else { rows }, cols)
+    // vt100 panics drawing a wide character on a single column.
+    (if rows > 1 { rows - 1 } else { rows }, cols.max(2))
 }
 
 pub fn nz(n: u16) -> NonZeroU16 {

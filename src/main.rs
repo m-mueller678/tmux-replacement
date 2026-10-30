@@ -5,6 +5,8 @@ mod menu;
 mod modes;
 mod paths;
 mod protocol;
+#[cfg(test)]
+mod repaint_cases;
 mod server;
 mod session;
 mod term;
