@@ -68,7 +68,47 @@ enum Key {
 }
 
 /// Decodes one key from the start of `bytes`, returning it and its length.
+/// The ctrl-b at the start of `bytes`, as its length: a plain 0x02, or one
+/// of the encodings terminals switch to for applications such as editors,
+/// under the kitty keyboard protocol or xterm's modifyOtherKeys.
+pub fn prefix_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() == Some(&0x02) {
+        return Some(1);
+    }
+    let rest = bytes.strip_prefix(b"\x1b[")?;
+    let end = rest.iter().position(|b| (0x40..=0x7e).contains(b))?;
+    // Parameters separated by ';', each with sub-parameters after ':'.
+    let params: Vec<Vec<Option<u32>>> = rest[..end]
+        .split(|&b| b == b';')
+        .map(|p| {
+            p.split(|&b| b == b':')
+                .map(|s| std::str::from_utf8(s).ok()?.parse().ok())
+                .collect()
+        })
+        .collect();
+    let get = |i: usize, j: usize| params.get(i).and_then(|p| p.get(j).copied().flatten());
+    // Ctrl alone; caps and num lock may be reported too.
+    let ctrl = |mods: Option<u32>| mods.is_some_and(|m| m.wrapping_sub(1) & !(64 | 128) == 4);
+    let found = match rest[end] {
+        // Key presses and repeats, not releases.
+        b'u' => get(0, 0) == Some(98) && ctrl(get(1, 0)) && matches!(get(1, 1), None | Some(1 | 2)),
+        b'~' => get(0, 0) == Some(27) && ctrl(get(1, 0)) && get(2, 0) == Some(98),
+        _ => false,
+    };
+    found.then_some(2 + end + 1)
+}
+
+/// Where the first ctrl-b in `bytes` starts, and its length.
+pub fn find_prefix(bytes: &[u8]) -> Option<(usize, usize)> {
+    (0..bytes.len())
+        .filter(|&i| matches!(bytes[i], 0x02 | 0x1b))
+        .find_map(|i| Some((i, prefix_len(&bytes[i..])?)))
+}
+
 fn parse_key(bytes: &[u8]) -> (Key, usize) {
+    if let Some(len) = prefix_len(bytes) {
+        return (Key::Prefix, len);
+    }
     let key = match bytes[0] {
         0x1b => match bytes.get(1) {
             // A lone escape at the end of a read is the escape key.
@@ -470,6 +510,22 @@ fn fuzzy_match(query: &str, text: &str) -> Option<(i64, Vec<usize>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_encoded_prefixes() {
+        assert_eq!(find_prefix(b"ab\x02c"), Some((2, 1)));
+        // Kitty keyboard protocol: plain, with lock modifiers, as a repeat,
+        // with alternate keys; but not a release or other keys.
+        assert_eq!(find_prefix(b"x\x1b[98;5u"), Some((1, 7)));
+        assert_eq!(find_prefix(b"\x1b[98;69u"), Some((0, 8)));
+        assert_eq!(find_prefix(b"\x1b[98;5:2u"), Some((0, 9)));
+        assert_eq!(find_prefix(b"\x1b[98::98;5u"), Some((0, 11)));
+        assert_eq!(find_prefix(b"\x1b[98;5:3u"), None);
+        assert_eq!(find_prefix(b"\x1b[98;6u\x1b[97;5u\x1b[98u"), None);
+        // modifyOtherKeys.
+        assert_eq!(find_prefix(b"\x1b[27;5;98~"), Some((0, 10)));
+        assert_eq!(find_prefix(b"\x1b[27;5;97~"), None);
+    }
 
     #[test]
     fn fuzzy_basics() {

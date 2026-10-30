@@ -14,6 +14,7 @@ use std::thread;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use vt100::capture::{BasicFormattedCaptureRange, BasicFormattedCaptureState};
 
+use crate::modes::Hooks;
 use crate::server::Event;
 use crate::term::MODE_RESET;
 
@@ -25,7 +26,7 @@ pub struct Session {
     pub name: String,
     pub pid: i32,
     master: File,
-    parser: vt100::Parser<Alerts>,
+    parser: vt100::Parser<Hooks>,
     /// Why the session wants the user's attention, while nobody looked yet.
     pub attention: Option<String>,
 }
@@ -117,7 +118,18 @@ impl Session {
         cmd.stdin(Stdio::from(pty.slave.try_clone()?))
             .stdout(Stdio::from(pty.slave.try_clone()?))
             .stderr(Stdio::from(pty.slave))
-            .env("BACK_BURNER_SESSION", &name);
+            .env("BACK_BURNER_SESSION", &name)
+            // The server may have been started from inside tmux, but its
+            // sessions are not tmux panes. Programs seeing these would use
+            // tmux, e.g. helix its buffers instead of the system clipboard.
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            // Without a display, programs copy through the terminal (OSC
+            // 52), which reaches the user's terminal wherever the session
+            // runs, local or remote. The server's display may also be long
+            // gone, as it outlives the login that started it.
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY");
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -161,7 +173,7 @@ impl Session {
                 nz(size.0),
                 nz(size.1),
                 SCROLLBACK,
-                Alerts::default(),
+                Hooks::default(),
             ),
             attention: None,
         })
@@ -172,8 +184,8 @@ impl Session {
     }
 
     pub fn process(&mut self, bytes: &[u8]) -> Alerts {
-        self.parser.process(bytes);
-        std::mem::take(self.parser.callbacks_mut())
+        crate::modes::process(&mut self.parser, bytes);
+        std::mem::take(&mut self.parser.callbacks_mut().alerts)
     }
 
     pub fn alternate_screen(&self) -> bool {
@@ -205,7 +217,13 @@ impl Session {
     /// Escape sequences restoring the input modes and cursor visibility the
     /// application inside the session expects.
     pub fn modes(&self) -> String {
-        modes(self.parser.screen())
+        modes(&self.parser)
+    }
+
+    /// Escape sequences undoing what [`Self::modes`] restores and vt100 does
+    /// not reset by itself.
+    pub fn leave(&self) -> String {
+        leave(&self.parser)
     }
 
     pub fn repaint(&mut self) -> String {
@@ -213,19 +231,39 @@ impl Session {
     }
 }
 
-pub fn modes(screen: &vt100::Screen) -> String {
+pub fn modes(parser: &vt100::Parser<Hooks>) -> String {
+    let screen = parser.screen();
     let cursor = if screen.hide_cursor() {
         "\x1b[?25l"
     } else {
         "\x1b[?25h"
     };
-    format!("{MODE_RESET}{}{cursor}", screen.input_mode_formatted())
+    // Applications like editors set the cursor's shape once and expect it
+    // to stay.
+    let shape = match screen.cursor_style() {
+        vt100::CursorStyle::Default => 0,
+        vt100::CursorStyle::BlinkBlock => 1,
+        vt100::CursorStyle::SteadyBlock => 2,
+        vt100::CursorStyle::BlinkUnderline => 3,
+        vt100::CursorStyle::SteadyUnderline => 4,
+        vt100::CursorStyle::BlinkVerticalBar => 5,
+        vt100::CursorStyle::SteadyVerticalBar => 6,
+    };
+    format!(
+        "{MODE_RESET}{}\x1b[{shape} q{cursor}{}",
+        screen.input_mode_formatted(),
+        parser.callbacks().restore(screen.alternate_screen())
+    )
+}
+
+pub fn leave(parser: &vt100::Parser<Hooks>) -> String {
+    parser.callbacks().reset(parser.screen().alternate_screen())
 }
 
 /// Escape sequences that replace the outer terminal's screen and scrollback
 /// with the emulated terminal's. Feeding them to a fresh emulator of the
 /// same size reproduces the state too.
-pub fn repaint<CB: vt100::Callbacks>(parser: &mut vt100::Parser<CB>) -> String {
+pub fn repaint(parser: &mut vt100::Parser<Hooks>) -> String {
     let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[?1049l\x1b[0m\x1b[H\x1b[2J\x1b[3J");
 
     // Emit the main screen with its scrollback as plain lines, so the outer
@@ -250,7 +288,7 @@ pub fn repaint<CB: vt100::Callbacks>(parser: &mut vt100::Parser<CB>) -> String {
     } else {
         out.push_str(&screen.attributes_formatted());
     }
-    out.push_str(&modes(parser.screen()));
+    out.push_str(&modes(parser));
     out.push_str("\x1b[?2026l");
     out
 }
@@ -280,5 +318,12 @@ mod tests {
             "hello"
         );
         assert!(alerts(b"\x1b]9;4;1;50\x07").notifications.is_empty());
+    }
+
+    #[test]
+    fn restores_cursor_shape() {
+        let mut parser = vt100::Parser::new_with_callbacks(nz(24), nz(80), 0, Hooks::default());
+        parser.process(b"\x1b[2 q");
+        assert!(modes(&parser).ends_with("\x1b[2 q\x1b[?25h"));
     }
 }

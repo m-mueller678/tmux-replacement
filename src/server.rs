@@ -14,7 +14,7 @@ use std::thread;
 use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::menu::{Action, BUILTINS, Item, Menu, Outcome, Target};
+use crate::menu::{Action, BUILTINS, Item, Menu, Outcome, Target, find_prefix};
 use crate::protocol::{self, ClientMsg, PACKAGE_VERSION, ServerMsg, VERSION};
 use crate::session::{Session, SessionId, view_size};
 use crate::{hosts, paths, term};
@@ -170,13 +170,12 @@ impl Server {
                     // With several clients on one session, whoever types
                     // decides its size.
                     session.resize(view_size(client.size));
-                    let split = input.iter().position(|&b| b == PREFIX);
-                    let (keys, rest) = input.split_at(split.unwrap_or(input.len()));
-                    session.write(keys);
-                    if split.is_none() {
+                    let Some((start, len)) = find_prefix(input) else {
+                        session.write(input);
                         return;
-                    }
-                    input = &rest[1..];
+                    };
+                    session.write(&input[..start]);
+                    input = &input[start + len..];
                     self.open_menu(cid, Some(id));
                 }
                 Mode::Menu(menu) => {
@@ -285,7 +284,8 @@ impl Server {
         let Some(client) = self.clients.get_mut(&cid) else {
             return;
         };
-        client.mode = Mode::Menu(Menu::new(return_to, items));
+        let previous = std::mem::replace(&mut client.mode, Mode::Menu(Menu::new(return_to, items)));
+        let leave = self.leave_session(&previous);
         self.post(
             cid,
             ServerMsg::View {
@@ -295,7 +295,7 @@ impl Server {
         );
         // The alternate screen preserves the session's display and
         // scrollback underneath the menu.
-        self.send(cid, format!("\x1b[?1049h{}", term::MODE_RESET));
+        self.send(cid, format!("{leave}\x1b[?1049h{}", term::MODE_RESET));
         self.render_menu(cid);
     }
 
@@ -505,10 +505,21 @@ impl Server {
     }
 
     /// Ends the client, leaving all sessions running.
+    /// Undoes what the session a client is attached to changed in its
+    /// terminal beyond what [`term::MODE_RESET`] covers.
+    fn leave_session(&self, mode: &Mode) -> String {
+        match mode {
+            Mode::Attached(id) => self.sessions.get(id).map(Session::leave),
+            Mode::Menu(_) => None,
+        }
+        .unwrap_or_default()
+    }
+
     fn detach(&mut self, cid: ClientId) {
         let Some(client) = self.clients.remove(&cid) else {
             return;
         };
+        let session_reset = self.leave_session(&client.mode);
         let on_alternate_screen = match client.mode {
             Mode::Menu(_) => true,
             Mode::Attached(id) => self.sessions.get(&id).is_some_and(|s| s.alternate_screen()),
@@ -521,7 +532,7 @@ impl Server {
         } else {
             ""
         };
-        let reset = format!("{leave}\r\n{}", term::reset());
+        let reset = format!("{session_reset}{leave}\r\n{}", term::reset());
         client.out.post(ServerMsg::Output(reset.into()));
         client.out.post(ServerMsg::Exit);
     }

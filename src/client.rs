@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
-use crate::menu::{Action, Item, Menu, Outcome, Target};
+use crate::menu::{Action, Item, Menu, Outcome, Target, find_prefix};
+use crate::modes::Hooks;
 use crate::protocol::{self, ClientMsg, PACKAGE_VERSION, ServerMsg, VERSION};
 use crate::session::{self, SCROLLBACK, nz, view_size};
 use crate::{bar, paths, term};
@@ -42,7 +43,6 @@ enum Event {
     Quit,
 }
 
-const PREFIX: u8 = 0x02; // ctrl-b
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// The sending half of a connection to the server.
@@ -172,7 +172,7 @@ fn read_messages(
 /// to show it while disconnected.
 struct Cached {
     name: String,
-    parser: vt100::Parser,
+    parser: vt100::Parser<Hooks>,
     /// When the server last sent output for it.
     updated: SystemTime,
 }
@@ -256,7 +256,9 @@ impl Client {
                     .first_mut()
                     .filter(|c| Some(&c.name) == self.view.as_ref())
                 {
-                    cached.parser.process(&bytes);
+                    crate::modes::process(&mut cached.parser, &bytes);
+                    // The server handles attention requests.
+                    cached.parser.callbacks_mut().alerts = Default::default();
                     cached.updated = SystemTime::now();
                 }
                 self.update_bar();
@@ -273,7 +275,12 @@ impl Client {
                             let (rows, cols) = view_size(self.size);
                             Cached {
                                 name: name.clone(),
-                                parser: vt100::Parser::new(nz(rows), nz(cols), SCROLLBACK),
+                                parser: vt100::Parser::new_with_callbacks(
+                                    nz(rows),
+                                    nz(cols),
+                                    SCROLLBACK,
+                                    Hooks::default(),
+                                ),
                                 updated: SystemTime::now(),
                             }
                         }
@@ -458,12 +465,15 @@ impl Client {
             None => cached.name.clone(),
         };
         let text = bar::text(&left, &self.host, cols);
-        // Setting the region homes the cursor; the session's cursor and
-        // colors come back last.
+        let hooks = cached.parser.callbacks();
+        // Setting the region homes the cursor; the session's cursor, colors
+        // and text modes come back last.
         let out = format!(
-            "\x1b[{top};{bottom}r\x1b[{rows};1H\x1b[0;30;{color}m{text}\x1b[0m{}{}",
+            "\x1b[{top};{bottom}r\x1b[{rows};1H{}\x1b[0;30;{color}m{text}\x1b[0m{}{}{}",
+            hooks.reset_text(),
             screen.cursor_state_formatted(),
-            screen.attributes_formatted()
+            screen.attributes_formatted(),
+            hooks.restore_text(),
         );
         term::write(out.as_bytes());
         self.bar_dirty = false;
@@ -499,6 +509,9 @@ impl Client {
             note: Some("quit; remote sessions keep running".into()),
             alert: false,
         });
+        if let Some(cached) = self.current() {
+            term::write(session::leave(&cached.parser).as_bytes());
+        }
         self.release_rows();
         term::write(format!("\x1b[?1049h{}", term::MODE_RESET).as_bytes());
         if let Some(offline) = &mut self.offline {
@@ -533,9 +546,9 @@ impl Client {
                 return;
             };
             let Some(menu) = &mut offline.menu else {
-                match input.iter().position(|&b| b == PREFIX) {
-                    Some(p) => {
-                        input = &input[p + 1..];
+                match find_prefix(input) {
+                    Some((start, len)) => {
+                        input = &input[start + len..];
                         self.open_offline_menu();
                     }
                     None => return,
@@ -712,8 +725,11 @@ pub fn run(server: Server) -> io::Result<()> {
     }
     if !client.detached {
         // An offline picker is on the alternate screen; leave it properly.
+        // Opening it already undid the session's modes.
         if client.offline.as_ref().is_some_and(|o| o.menu.is_some()) {
             term::write(b"\x1b[?1049l");
+        } else if let Some(cached) = client.current() {
+            term::write(session::leave(&cached.parser).as_bytes());
         }
         term::write(b"\x1b[?1047l");
     }

@@ -2,6 +2,7 @@ mod bar;
 mod client;
 mod hosts;
 mod menu;
+mod modes;
 mod paths;
 mod protocol;
 mod server;
