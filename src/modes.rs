@@ -23,20 +23,16 @@ const PRIVATE_MODES: &[(u16, bool)] = &[
 /// Feeds output to a session's emulator. Also tracks what vt100 handles
 /// without telling its callbacks: full resets, and shifting to G1 and back
 /// (SO and SI).
-pub fn process(parser: &mut vt100::Parser<Hooks>, mut bytes: &[u8]) {
-    // A reset split across reads.
-    if parser.callbacks().trailing_escape && bytes.first() == Some(&b'c') {
-        process_part(parser, &bytes[..1]);
-        reset(parser);
-        bytes = &bytes[1..];
+pub fn process(parser: &mut vt100::Parser<Hooks>, bytes: &[u8]) {
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if parser.callbacks_mut().scan(b) {
+            parser.process(&bytes[start..=i]);
+            reset(parser);
+            start = i + 1;
+        }
     }
-    while let Some(i) = bytes.windows(2).position(|w| w == b"\x1bc") {
-        let (head, rest) = bytes.split_at(i + 2);
-        process_part(parser, head);
-        reset(parser);
-        bytes = rest;
-    }
-    process_part(parser, bytes);
+    parser.process(&bytes[start..]);
 }
 
 fn reset(parser: &mut vt100::Parser<Hooks>) {
@@ -51,13 +47,17 @@ fn reset(parser: &mut vt100::Parser<Hooks>) {
     };
 }
 
-fn process_part(parser: &mut vt100::Parser<Hooks>, bytes: &[u8]) {
-    parser.process(bytes);
-    let hooks = parser.callbacks_mut();
-    if let Some(&b) = bytes.iter().rev().find(|&&b| matches!(b, 0x0e | 0x0f)) {
-        hooks.shifted = b == 0x0e;
-    }
-    hooks.trailing_escape = bytes.last() == Some(&0x1b);
+/// Where the output so far ended, as far as [`Hooks::scan`] needs to know.
+#[derive(Default, Clone, Copy)]
+enum Scan {
+    #[default]
+    Ground,
+    Esc,
+    /// After `ESC` and intermediate bytes, as in `ESC ( 0`.
+    EscIntermediate,
+    Csi,
+    /// Inside an OSC, DCS or similar string, where controls are data.
+    Str,
 }
 
 /// Callbacks for a session's emulator: collects attention requests and
@@ -82,13 +82,42 @@ pub struct Hooks {
     /// Foreground, background and cursor color set with OSC 10, 11 and 12.
     dynamic: [Option<Vec<u8>>; 3],
     title: Option<Vec<u8>>,
-    /// Whether the output so far ended in ESC.
-    trailing_escape: bool,
+    scan: Scan,
     /// Whether colors may have been changed before a full reset.
     colors_unknown: bool,
 }
 
 impl Hooks {
+    /// Follows the output byte by byte, as vt100's parser does, so SO, SI
+    /// and resets count only where they take effect, even when split
+    /// across reads. Returns whether `b` completes a full reset.
+    fn scan(&mut self, b: u8) -> bool {
+        self.scan = match (self.scan, b) {
+            (Scan::Str, 0x07 | 0x18 | 0x1a) => Scan::Ground,
+            // ESC ends a string; `ESC \` is just the usual way.
+            (_, 0x1b) => Scan::Esc,
+            (Scan::Str, _) => Scan::Str,
+            (_, 0x18 | 0x1a) => Scan::Ground,
+            // Controls take effect even inside escape sequences.
+            (state, 0x0e | 0x0f) => {
+                self.shifted = b == 0x0e;
+                state
+            }
+            (Scan::Esc, b'c') => {
+                self.scan = Scan::Ground;
+                return true;
+            }
+            (Scan::Esc, b'[') => Scan::Csi,
+            (Scan::Esc, b']' | b'P' | b'X' | b'^' | b'_') => Scan::Str,
+            (Scan::Esc | Scan::EscIntermediate, 0x20..=0x2f) => Scan::EscIntermediate,
+            (state @ (Scan::Esc | Scan::EscIntermediate | Scan::Csi), 0x00..=0x1f) => state,
+            (Scan::Csi, 0x40..=0x7e) => Scan::Ground,
+            (Scan::Csi, _) => Scan::Csi,
+            _ => Scan::Ground,
+        };
+        false
+    }
+
     fn kitty_flags(&self, alternate: bool) -> u16 {
         self.kitty[alternate as usize].last().copied().unwrap_or(0)
     }
@@ -367,5 +396,18 @@ mod tests {
         process(&mut p, b"\x1b[?1004h\x1b");
         process(&mut p, b"c");
         assert_eq!(p.callbacks().reset(false), after_reset);
+    }
+
+    #[test]
+    fn ignores_lookalikes_in_strings() {
+        // SO as data in strings, and `c` ending `ESC (` rather than
+        // following a lone ESC, split across reads; SO in a CSI counts.
+        let mut p = hooks(b"");
+        process(&mut p, b"\x1bP\x0e\x1b\\\x1b)0\x1b[?1004h\x1b(");
+        process(&mut p, b"c\x1b]0;\x0e");
+        process(&mut p, b"\x07\x1b[1\x0e;1H");
+        let h = p.callbacks();
+        assert_eq!(h.restore_text(), "\x1b)0\x0e");
+        assert!(h.reset(false).starts_with("\x1b[?1004l"));
     }
 }
