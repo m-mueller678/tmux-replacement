@@ -227,6 +227,10 @@ impl Client {
             cwd: std::env::current_dir().unwrap_or_default(),
             token: self.token,
             resume: self.view.clone(),
+            terminal: session::TERMINAL_VARS
+                .iter()
+                .filter_map(|&name| Some((name.into(), std::env::var_os(name)?)))
+                .collect(),
         }
     }
 

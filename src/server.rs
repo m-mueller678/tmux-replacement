@@ -5,6 +5,7 @@
 //! here and clients only relay keys and terminal output.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ pub struct Greeting {
     cwd: PathBuf,
     token: u64,
     resume: Option<String>,
+    terminal: Vec<(OsString, OsString)>,
 }
 
 /// Messages a client has not read yet before it is considered gone. Bounds
@@ -71,6 +73,8 @@ struct Client {
     size: (u16, u16),
     /// Starting directory for sessions created without a previous session.
     cwd: PathBuf,
+    /// The client's terminal variables, for the sessions it creates.
+    terminal: Vec<(OsString, OsString)>,
     token: u64,
     out: Peer,
 }
@@ -134,6 +138,7 @@ impl Server {
             mode: Mode::Attached(SessionId::MAX),
             size: hello.size,
             cwd: hello.cwd,
+            terminal: hello.terminal,
             token: hello.token,
             out,
         };
@@ -400,6 +405,7 @@ impl Server {
             name,
             view_size(client.size),
             Some(cwd),
+            &client.terminal,
             self.events.clone(),
         ) {
             Ok(session) => {
@@ -632,6 +638,7 @@ pub fn run() -> io::Result<()> {
                     cwd,
                     token,
                     resume,
+                    terminal,
                 }) => {
                     let hello = Greeting {
                         version,
@@ -639,6 +646,7 @@ pub fn run() -> io::Result<()> {
                         cwd,
                         token,
                         resume,
+                        terminal,
                     };
                     let _ = tx.send(Event::Connected(stream, hello));
                 }

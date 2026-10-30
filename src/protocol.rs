@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 /// Bumped whenever the protocol changes, so a client never talks to a
 /// server from an incompatible build.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// The version of this build, for telling the user which servers mismatch.
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -41,6 +41,9 @@ pub enum ClientMsg {
         token: u64,
         /// Session to attach to right away instead of opening the picker.
         resume: Option<String>,
+        /// The client's values of [`crate::session::TERMINAL_VARS`] that
+        /// are set.
+        terminal: Vec<(OsString, OsString)>,
     },
     Input(Vec<u8>),
     Resize((u16, u16)),
@@ -176,14 +179,19 @@ impl ClientMsg {
                 cwd,
                 token,
                 resume,
+                terminal,
             } => {
-                let p = Fields::default()
+                let mut p = Fields::default()
                     .u32(*version)
                     .u16(size.0)
                     .u16(size.1)
                     .bytes(cwd.as_os_str().as_bytes())
                     .u64(*token)
-                    .opt(resume.as_deref().map(str::as_bytes));
+                    .opt(resume.as_deref().map(str::as_bytes))
+                    .u16(terminal.len() as u16);
+                for (name, value) in terminal {
+                    p = p.bytes(name.as_bytes()).bytes(value.as_bytes());
+                }
                 frame(0, &p.0)
             }
             ClientMsg::Input(bytes) => frame(1, bytes),
@@ -206,6 +214,7 @@ impl ClientMsg {
                         cwd: PathBuf::new(),
                         token: 0,
                         resume: None,
+                        terminal: Vec::new(),
                     });
                 }
                 ClientMsg::Hello {
@@ -214,6 +223,12 @@ impl ClientMsg {
                     cwd: OsString::from_vec(c.bytes()?).into(),
                     token: c.u64()?,
                     resume: c.opt_string()?,
+                    terminal: (0..c.u16()?)
+                        .map(|_| {
+                            let name = OsString::from_vec(c.bytes()?);
+                            Ok((name, OsString::from_vec(c.bytes()?)))
+                        })
+                        .collect::<io::Result<_>>()?,
                 }
             }
             1 => ClientMsg::Input(p),
@@ -294,6 +309,7 @@ mod tests {
             cwd: "/tmp/x".into(),
             token: 99,
             resume: Some("work".into()),
+            terminal: vec![("TERM".into(), "xterm-kitty".into())],
         };
         let mut bytes = hello.encode();
         bytes.extend(ClientMsg::Resize((3, 4)).encode());
@@ -306,8 +322,10 @@ mod tests {
                 cwd,
                 token,
                 resume,
+                terminal,
             } => {
                 assert_eq!((version, size, token), (VERSION, (24, 80), 99));
+                assert_eq!(terminal, [("TERM".into(), "xterm-kitty".into())]);
                 assert_eq!(
                     (cwd, resume.as_deref()),
                     (PathBuf::from("/tmp/x"), Some("work"))

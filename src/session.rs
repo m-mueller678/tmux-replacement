@@ -1,6 +1,7 @@
 //! A shell running on its own pty, plus an emulated copy of its screen so it
 //! can be redrawn when the user switches back to it.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU16;
@@ -79,6 +80,11 @@ impl vt100::Callbacks for Alerts {
 
 /// The size a session gets in a terminal of `size`: the bottom row is left
 /// for the status bar, and it is at least two columns wide.
+/// Variables describing the user's terminal. Sessions get the values of the
+/// client that creates them rather than the server's, which may have been
+/// started without a terminal, e.g. through `ssh -T` with TERM=dumb.
+pub const TERMINAL_VARS: &[&str] = &["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
+
 pub fn view_size((rows, cols): (u16, u16)) -> (u16, u16) {
     // vt100 panics drawing a wide character on a single column.
     (if rows > 1 { rows - 1 } else { rows }, cols.max(2))
@@ -103,6 +109,7 @@ impl Session {
         name: String,
         size: (u16, u16),
         cwd: Option<PathBuf>,
+        terminal: &[(OsString, OsString)],
         events: Sender<Event>,
     ) -> io::Result<Session> {
         let pty = nix::pty::openpty(Some(&winsize(size)), None)?;
@@ -131,6 +138,10 @@ impl Session {
             // gone, as it outlives the login that started it.
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY");
+        for name in TERMINAL_VARS {
+            cmd.env_remove(name);
+        }
+        cmd.envs(terminal.iter().cloned());
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
