@@ -9,10 +9,10 @@ mod session;
 mod term;
 
 const USAGE: &str = "\
-usage: tmux-replacement [--kill-server]
+usage: back-burner [--kill-server]
 
 Starts with a picker of machines: this one, or any host from your ssh
-config, reached through ssh with tmux-replacement on the remote PATH.
+config, reached through ssh with back-burner on the remote PATH.
 Ctrl-b then opens the session picker. --kill-server ends the server on this
 machine and all its sessions, whichever version it is.";
 
@@ -44,7 +44,7 @@ fn kill_server() -> std::io::Result<()> {
 }
 
 fn run_client() -> std::io::Result<()> {
-    if std::env::var_os("TMUX_REPLACEMENT_SESSION").is_some() {
+    if std::env::var_os("BACK_BURNER_SESSION").is_some() {
         eprintln!("already running inside a session");
         std::process::exit(1);
     }

@@ -14,27 +14,27 @@
     in
     {
       packages = forAllSystems (pkgs: {
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.tmux-replacement;
-        tmux-replacement = pkgs.rustPlatform.buildRustPackage {
-          pname = "tmux-replacement";
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.back-burner;
+        back-burner = pkgs.rustPlatform.buildRustPackage {
+          pname = "back-burner";
           version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
           src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
           meta = {
             description = "A tmux-like session manager with an fzf-style picker and no split screens";
-            mainProgram = "tmux-replacement";
+            mainProgram = "back-burner";
             platforms = pkgs.lib.platforms.linux;
           };
         };
       });
 
       overlays.default = final: _prev: {
-        tmux-replacement = self.packages.${final.stdenv.hostPlatform.system}.tmux-replacement;
+        back-burner = self.packages.${final.stdenv.hostPlatform.system}.back-burner;
       };
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.tmux-replacement ];
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.back-burner ];
           packages = with pkgs; [
             clippy
             rustfmt

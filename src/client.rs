@@ -25,7 +25,7 @@ use crate::{bar, paths, term};
 
 pub enum Server {
     Local,
-    /// Reached through `ssh <destination> tmux-replacement --proxy`.
+    /// Reached through `ssh <destination> back-burner --proxy`.
     Remote {
         destination: String,
     },
@@ -101,7 +101,7 @@ fn connect(
                 // Nobody can answer a prompt in the middle of the session.
                 cmd.args(["-o", "BatchMode=yes"]);
             }
-            cmd.args(["--", destination, "tmux-replacement", "--proxy"])
+            cmd.args(["--", destination, "back-burner", "--proxy"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(if interactive {
@@ -744,7 +744,7 @@ pub fn kill(server: &Server) -> io::Result<bool> {
             if UnixStream::connect(&path).is_ok() {
                 return Err(io::Error::other(
                     "the server is too old to be killed this way; \
-                     run: pkill -f 'tmux-replacement --server'",
+                     run: pkill -f 'back-burner --server'",
                 ));
             }
             Ok(true)

@@ -117,7 +117,7 @@ impl Session {
         cmd.stdin(Stdio::from(pty.slave.try_clone()?))
             .stdout(Stdio::from(pty.slave.try_clone()?))
             .stderr(Stdio::from(pty.slave))
-            .env("TMUX_REPLACEMENT_SESSION", &name);
+            .env("BACK_BURNER_SESSION", &name);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }

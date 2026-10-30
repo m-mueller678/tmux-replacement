@@ -9,7 +9,7 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|d| !d.is_empty())
         .map_or_else(std::env::temp_dir, PathBuf::from);
-    let dir = base.join(format!("tmux-replacement-{uid}"));
+    let dir = base.join(format!("back-burner-{uid}"));
     std::fs::DirBuilder::new()
         .mode(0o700)
         .recursive(true)
