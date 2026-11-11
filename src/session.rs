@@ -30,6 +30,8 @@ pub struct Session {
     parser: vt100::Parser<Hooks>,
     /// Why the session wants the user's attention, while nobody looked yet.
     pub attention: Option<String>,
+    /// Whether the application was last told it has focus.
+    focused: bool,
 }
 
 /// Requests for the user's attention found in a session's output.
@@ -188,7 +190,27 @@ impl Session {
                 Hooks::default(),
             ),
             attention: None,
+            focused: false,
         })
+    }
+
+    /// Tells an application asking for focus reports that a client shows
+    /// it now. Sent on every attach: the terminal's own focus-in may have
+    /// gone to a picker or been lost with the connection, leaving e.g.
+    /// helix drawing its cursor as unfocused.
+    pub fn focus_in(&mut self) {
+        if self.parser.callbacks().focus_reports() {
+            self.write(b"\x1b[I");
+        }
+        self.focused = true;
+    }
+
+    /// Tells the application that no client shows it any more.
+    pub fn focus_out(&mut self) {
+        if self.focused && self.parser.callbacks().focus_reports() {
+            self.write(b"\x1b[O");
+        }
+        self.focused = false;
     }
 
     pub fn write(&mut self, bytes: &[u8]) {

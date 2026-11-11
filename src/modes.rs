@@ -118,6 +118,12 @@ impl Hooks {
         false
     }
 
+    /// Whether the application asked to be told when the terminal gains
+    /// and loses focus.
+    pub fn focus_reports(&self) -> bool {
+        self.private.get(&1004) == Some(&true)
+    }
+
     fn kitty_flags(&self, alternate: bool) -> u16 {
         self.kitty[alternate as usize].last().copied().unwrap_or(0)
     }
@@ -352,6 +358,7 @@ mod tests {
         // kitty keyboard protocol; autowrap switched off and on again.
         let p = hooks(b"\x1b[?1049h\x1b[?1004h\x1b[>1u\x1b[=3;2u\x1b[?7l\x1b[?7h\x1b]2;hx\x07");
         let h = p.callbacks();
+        assert!(h.focus_reports());
         assert_eq!(h.reset(true), "\x1b[?1004l\x1b[=0;1u\x1b]2;back-burner\x07");
         assert_eq!(h.restore(true), "\x1b[?1004h\x1b[=3;1u\x1b]2;hx\x07");
         // The main screen's keyboard stack is untouched.

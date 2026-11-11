@@ -353,6 +353,7 @@ impl Server {
         let previous = std::mem::replace(&mut client.mode, Mode::Attached(id));
         let session = self.sessions.get_mut(&id).unwrap();
         session.attention = None;
+        session.focus_in();
         let resized = session.resize(view_size(client.size));
         let replay = match previous {
             Mode::Menu(mut menu)
@@ -543,6 +544,19 @@ impl Server {
         client.out.post(ServerMsg::Exit);
     }
 
+    /// Tells sessions no client shows any more that they lost focus.
+    fn update_focus(&mut self) {
+        for (id, session) in &mut self.sessions {
+            let shown = self
+                .clients
+                .values()
+                .any(|c| matches!(c.mode, Mode::Attached(a) if a == *id));
+            if !shown {
+                session.focus_out();
+            }
+        }
+    }
+
     fn done(&self) -> bool {
         self.quit || (self.clients.is_empty() && self.sessions.is_empty())
     }
@@ -684,6 +698,7 @@ pub fn run() -> io::Result<()> {
             }
             Event::Quit => server.quit = true,
         }
+        server.update_focus();
         if server.done() {
             break;
         }
