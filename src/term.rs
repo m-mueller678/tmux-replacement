@@ -11,7 +11,10 @@ pub const MODE_RESET: &str = "\x1b[?1l\x1b>\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1
 
 /// Puts the terminal back in a sane state for the shell the user returns to.
 pub fn reset() -> String {
-    format!("{MODE_RESET}\x1b[0m\x1b[?25h")
+    // Also switch off the kitty keyboard protocol and modifyOtherKeys, in
+    // case a session's changes were not undone: keys would arrive as
+    // escape sequences the shell does not understand.
+    format!("{MODE_RESET}\x1b[0m\x1b[?25h\x1b[=0;1u\x1b[>4;0m")
 }
 
 static ORIGINAL: Mutex<Option<Termios>> = Mutex::new(None);

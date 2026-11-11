@@ -458,15 +458,21 @@ impl Server {
     }
 
     fn remove(&mut self, id: SessionId) {
-        if self.sessions.remove(&id).is_none() {
+        let Some(session) = self.sessions.remove(&id) else {
             return;
-        }
+        };
+        // The session is gone before its clients leave it, so undo its
+        // changes to their terminals here.
+        let leave = session.leave();
         self.mru.retain(|&s| s != id);
         self.broadcast_sessions();
         let cids: Vec<_> = self.clients.keys().copied().collect();
         for cid in cids {
             match &mut self.clients.get_mut(&cid).unwrap().mode {
-                Mode::Attached(active) if *active == id => self.open_menu(cid, None),
+                Mode::Attached(active) if *active == id => {
+                    self.send(cid, leave.clone());
+                    self.open_menu(cid, None);
+                }
                 Mode::Attached(_) => {}
                 Mode::Menu(menu) => {
                     if menu.return_to == Some(id) {
