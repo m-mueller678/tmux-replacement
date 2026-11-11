@@ -39,11 +39,19 @@ enum Event {
     Message(u64, ServerMsg),
     /// The connection with the given generation ended.
     Lost(u64, String),
-    Retry,
+    /// Time to reconnect, if still on the given generation.
+    Retry(u64),
+    /// Reconnecting on the given generation takes too long.
+    Stalled(u64),
+    /// The machine woke from suspend.
+    Woke,
     Quit,
 }
 
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// How long a reconnect may take. After a suspend or a network change, an
+/// attempt can hang without ssh ever giving up on it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The sending half of a connection to the server.
 struct Connection {
@@ -152,6 +160,33 @@ fn connect(
             })
         }
     }
+}
+
+fn send_later(events: &Sender<Event>, delay: Duration, event: Event) {
+    let events = events.clone();
+    thread::spawn(move || {
+        thread::sleep(delay);
+        let _ = events.send(event);
+    });
+}
+
+/// Sends `Woke` after the machine was suspended: the monotonic clock stops
+/// meanwhile, the wall clock does not.
+fn watch_for_suspend(events: Sender<Event>) {
+    const TICK: Duration = Duration::from_secs(1);
+    thread::spawn(move || {
+        let mut last = (Instant::now(), SystemTime::now());
+        loop {
+            thread::sleep(TICK);
+            let now = (Instant::now(), SystemTime::now());
+            let awake = now.0 - last.0;
+            let passed = now.1.duration_since(last.1).unwrap_or_default();
+            if passed > awake + 3 * TICK && events.send(Event::Woke).is_err() {
+                return;
+            }
+            last = now;
+        }
+    });
 }
 
 fn read_messages(
@@ -318,6 +353,18 @@ impl Client {
     }
 
     fn lost(&mut self, reason: String) {
+        self.disconnected(reason, false);
+    }
+
+    /// Abandons the current connection, whatever its state, and reconnects
+    /// right away.
+    fn reconnect(&mut self, reason: String) {
+        // Whatever the old connection still delivers is stale.
+        self.generation += 1;
+        self.disconnected(reason, true);
+    }
+
+    fn disconnected(&mut self, reason: String, now: bool) {
         self.conn = None;
         if !self.remote() {
             self.quit = true;
@@ -332,7 +379,11 @@ impl Client {
         let retry_delay = match &mut self.offline {
             Some(offline) => {
                 offline.reason = reason;
-                offline.retry_delay = (offline.retry_delay * 2).min(MAX_RETRY_DELAY);
+                offline.retry_delay = if now {
+                    Duration::from_secs(1)
+                } else {
+                    (offline.retry_delay * 2).min(MAX_RETRY_DELAY)
+                };
                 offline.retry_delay
             }
             None => {
@@ -350,11 +401,8 @@ impl Client {
             }
         };
         self.draw_offline();
-        let events = self.events.clone();
-        thread::spawn(move || {
-            thread::sleep(retry_delay);
-            let _ = events.send(Event::Retry);
-        });
+        let retry_delay = if now { Duration::ZERO } else { retry_delay };
+        send_later(&self.events, retry_delay, Event::Retry(self.generation));
     }
 
     fn retry(&mut self) {
@@ -364,12 +412,32 @@ impl Client {
             Ok(mut conn) => {
                 conn.send(self.hello());
                 self.conn = Some(conn);
+                send_later(
+                    &self.events,
+                    CONNECT_TIMEOUT,
+                    Event::Stalled(self.generation),
+                );
             }
             Err(e) => {
                 let _ = self
                     .events
                     .send(Event::Lost(self.generation, e.to_string()));
             }
+        }
+    }
+
+    fn stalled(&mut self) {
+        if !self.established {
+            let secs = CONNECT_TIMEOUT.as_secs();
+            self.reconnect(format!("no answer within {secs}s"));
+        }
+    }
+
+    /// The connection probably died during the suspend, but ssh takes a
+    /// while to notice; meanwhile, the session looks frozen.
+    fn woke(&mut self) {
+        if self.remote() {
+            self.reconnect("woke from suspend".into());
         }
     }
 
@@ -698,6 +766,10 @@ pub fn run(server: Server) -> io::Result<()> {
         }
     });
 
+    if client.remote() {
+        watch_for_suspend(tx.clone());
+    }
+
     let input_tx = tx;
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
@@ -722,8 +794,10 @@ pub fn run(server: Server) -> io::Result<()> {
             Event::Lost(generation, reason) if generation == client.generation => {
                 client.lost(reason)
             }
-            Event::Message(..) | Event::Lost(..) => {}
-            Event::Retry => client.retry(),
+            Event::Retry(generation) if generation == client.generation => client.retry(),
+            Event::Stalled(generation) if generation == client.generation => client.stalled(),
+            Event::Message(..) | Event::Lost(..) | Event::Retry(..) | Event::Stalled(..) => {}
+            Event::Woke => client.woke(),
             Event::Quit => client.quit = true,
         }
     }
