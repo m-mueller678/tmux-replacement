@@ -4,6 +4,7 @@ use std::fmt::Write;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::search::search;
 use crate::session::SessionId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,9 +270,7 @@ impl Menu {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| {
-                fuzzy_match(&self.query, &item.label).map(|(s, pos)| (s, i, pos))
-            })
+            .filter_map(|(i, item)| search(&self.query, &item.label).map(|(s, pos)| (s, i, pos)))
             .collect();
         // Stable sort keeps the original order among equal scores.
         scored.sort_by_key(|s| std::cmp::Reverse(s.0));
@@ -462,55 +461,6 @@ fn truncate(s: &str, max: usize) -> String {
         .collect()
 }
 
-/// Case-insensitive subsequence match. Returns a score (higher is better) and
-/// the matched char positions in `text`.
-fn fuzzy_match(query: &str, text: &str) -> Option<(i64, Vec<usize>)> {
-    let query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    if query.is_empty() {
-        return Some((0, Vec::new()));
-    }
-    let text: Vec<char> = text
-        .chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect();
-
-    // Try every start position of the first query char and greedily match
-    // the rest; keep the best scoring alignment.
-    let mut best: Option<(i64, Vec<usize>)> = None;
-    for start in (0..text.len()).filter(|&s| text[s] == query[0]) {
-        let mut positions = vec![start];
-        let mut t = start + 1;
-        for &qc in &query[1..] {
-            match (t..text.len()).find(|&j| text[j] == qc) {
-                Some(j) => {
-                    positions.push(j);
-                    t = j + 1;
-                }
-                None => break,
-            }
-        }
-        if positions.len() != query.len() {
-            break;
-        }
-        let mut score = 0i64;
-        for (k, &p) in positions.iter().enumerate() {
-            let boundary = p == 0 || !text[p - 1].is_alphanumeric();
-            if boundary {
-                score += 8;
-            }
-            if k > 0 {
-                let gap = (p - positions[k - 1] - 1) as i64;
-                score += if gap == 0 { 6 } else { -gap.min(10) };
-            }
-        }
-        score -= (text.len() as i64) / 8;
-        if best.as_ref().is_none_or(|(s, _)| score > *s) {
-            best = Some((score, positions));
-        }
-    }
-    best
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,16 +479,6 @@ mod tests {
         // modifyOtherKeys.
         assert_eq!(find_prefix(b"\x1b[27;5;98~"), Some((0, 10)));
         assert_eq!(find_prefix(b"\x1b[27;5;97~"), None);
-    }
-
-    #[test]
-    fn fuzzy_basics() {
-        assert!(fuzzy_match("abc", "a_b_c").is_some());
-        assert!(fuzzy_match("abd", "abc").is_none());
-        assert_eq!(fuzzy_match("NE", "new").unwrap().1, vec![0, 1]);
-        let contiguous = fuzzy_match("web", "web-server").unwrap().0;
-        let scattered = fuzzy_match("web", "wild-ember").unwrap().0;
-        assert!(contiguous > scattered);
     }
 
     #[test]

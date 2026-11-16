@@ -7,6 +7,7 @@ mod paths;
 mod protocol;
 #[cfg(test)]
 mod repaint_cases;
+mod search;
 mod server;
 mod session;
 mod term;
