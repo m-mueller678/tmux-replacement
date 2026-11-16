@@ -70,7 +70,7 @@ fn pick(menu: &mut Menu) -> io::Result<Option<usize>> {
             input = &input[consumed..];
             match outcome {
                 Outcome::Select(Target::Session(i)) => return Ok(Some(i as usize)),
-                Outcome::Cancel => return Ok(None),
+                Outcome::Cancel | Outcome::Select(Target::Action(_)) => return Ok(None),
                 _ => {}
             }
         }

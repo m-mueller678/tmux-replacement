@@ -64,6 +64,8 @@ enum Key {
     DeleteWord,
     Prefix,
     Interrupt,
+    /// Ctrl-d: leave back-burner, as the shell does.
+    Exit,
     Ignored,
 }
 
@@ -130,6 +132,7 @@ fn parse_key(bytes: &[u8]) -> (Key, usize) {
         b'\r' => Key::Enter,
         0x02 => Key::Prefix,
         0x03 | 0x07 => Key::Interrupt,
+        0x04 => Key::Exit,
         0x10 | 0x0b => Key::Up,
         0x0e | b'\n' => Key::Down,
         0x7f | 0x08 => Key::Backspace,
@@ -286,6 +289,7 @@ impl Menu {
             let outcome = match key {
                 Key::Prefix => Outcome::PassPrefix,
                 Key::Interrupt => Outcome::Cancel,
+                Key::Exit => Outcome::Select(Target::Action(Action::Exit)),
                 _ if self.naming.is_some() => self.name_key(key),
                 _ => self.list_key(key),
             };
@@ -565,6 +569,10 @@ mod tests {
         ));
         assert!(matches!(menu.handle_input(b"\x1b"), (Outcome::Cancel, 1)));
         assert!(matches!(
+            menu.handle_input(b"ab\x04"),
+            (Outcome::Select(Target::Action(Action::Exit)), 3)
+        ));
+        assert!(matches!(
             menu.handle_input(b"\x02x"),
             (Outcome::PassPrefix, 1)
         ));
@@ -583,6 +591,10 @@ mod tests {
         menu.handle_input(b"a#b");
         assert!(matches!(menu.handle_input(b"\r"), (Outcome::Continue, 1)));
         assert!(menu.message.is_some());
+        assert!(matches!(
+            menu.handle_input(b"\x04"),
+            (Outcome::Select(Target::Action(Action::Exit)), 1)
+        ));
         menu.handle_input(b"\x1b");
         assert!(menu.naming.is_none());
         assert!(matches!(menu.handle_input(b"\x1b"), (Outcome::Cancel, 1)));
