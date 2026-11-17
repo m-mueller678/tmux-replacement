@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::search::search;
+use crate::search::Query;
 use crate::session::SessionId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,11 +266,12 @@ impl Menu {
     }
 
     fn refilter(&mut self) {
-        let mut scored: Vec<(i64, usize, Vec<usize>)> = self
+        let mut query = Query::new(&self.query);
+        let mut scored: Vec<(u32, usize, Vec<usize>)> = self
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| search(&self.query, &item.label).map(|(s, pos)| (s, i, pos)))
+            .filter_map(|(i, item)| query.matches(&item.label).map(|(s, pos)| (s, i, pos)))
             .collect();
         // Stable sort keeps the original order among equal scores.
         scored.sort_by_key(|s| std::cmp::Reverse(s.0));
